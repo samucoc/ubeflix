@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ubeflix-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ubeflix
+      POSTGRES_USER: ubeflix_user
+      POSTGRES_PASSWORD: ubeflix_secret_2024
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/src/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - ubeflix-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ubeflix_user -d ubeflix"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ubeflix-backend
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: production
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ubeflix
+      DB_USER: ubeflix_user
+      DB_PASSWORD: ubeflix_secret_2024
+      JWT_SECRET: ubeflix_jwt_super_secret_key_2024
+      PORT: 3001
+      VIDEOS_PATH: /videos
+    volumes:
+      - ./videos:/videos:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - ubeflix-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL: http://localhost:3001/api
+    container_name: ubeflix-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - ubeflix-network
+
+volumes:
+  postgres_data:
+
+networks:
+  ubeflix-network:
+    driver: bridge
