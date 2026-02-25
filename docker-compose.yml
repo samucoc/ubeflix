@@ -6,9 +6,9 @@ services:
     container_name: ubeflix-db
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ubeflix
-      POSTGRES_USER: ubeflix_user
-      POSTGRES_PASSWORD: ubeflix_secret_2024
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
       - "5433:5432"
     volumes:
@@ -17,7 +17,7 @@ services:
     networks:
       - ubeflix-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ubeflix_user -d ubeflix"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -29,16 +29,16 @@ services:
     container_name: ubeflix-backend
     restart: unless-stopped
     ports:
-      - "3001:3001"
+      - "5566:5566"
     environment:
-      NODE_ENV: production
+      NODE_ENV: ${NODE_ENV}
       DB_HOST: db
       DB_PORT: 5432
-      DB_NAME: ubeflix
-      DB_USER: ubeflix_user
-      DB_PASSWORD: ubeflix_secret_2024
-      JWT_SECRET: ubeflix_jwt_super_secret_key_2024
-      PORT: 3001
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      PORT: ${PORT}
       VIDEOS_PATH: /videos
     volumes:
       - ./videos:/videos:ro
@@ -53,11 +53,11 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        REACT_APP_API_URL: http://localhost:3001/api
+        REACT_APP_API_URL: ${REACT_APP_API_URL}
     container_name: ubeflix-frontend
     restart: unless-stopped
     ports:
-      - "3000:80"
+      - "3344:80"
     depends_on:
       - backend
     networks:

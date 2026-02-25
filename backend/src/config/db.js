@@ -5,7 +5,7 @@ const pool = new Pool({
   port: parseInt(process.env.DB_PORT || '5432'),
   database: process.env.DB_NAME || 'ubeflix',
   user: process.env.DB_USER || 'ubeflix_user',
-  password: process.env.DB_PASSWORD || 'ubeflix_secret_2024',
+  password: process.env.DB_PASSWORD,
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
