@@ -109,3 +109,45 @@ CREATE INDEX IF NOT EXISTS idx_videos_title ON videos(title);
 INSERT INTO users (username, email, password_hash, is_admin)
 VALUES ('admin', 'admin@ubeflix.local', '$2a$10$zFo7nqXhpAlrPLCozP/o0OB/rY7BGNmvkxJHPXOWdB.LK0X61k/Rm', TRUE)
 ON CONFLICT (username) DO NOTHING;
+
+-- Subtitles table
+CREATE TABLE IF NOT EXISTS subtitles (
+    id SERIAL PRIMARY KEY,
+    video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
+    label VARCHAR(100) NOT NULL DEFAULT 'Español',
+    language VARCHAR(10) NOT NULL DEFAULT 'es',
+    format VARCHAR(10) NOT NULL DEFAULT 'vtt', -- 'vtt', 'srt', 'ass'
+    file_path VARCHAR(500) NOT NULL,
+    source VARCHAR(50) DEFAULT 'embedded', -- 'embedded', 'external', 'subdivx', 'opensubtitles'
+    is_default BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_subtitles_video ON subtitles(video_id);
+
+-- Thumbnail path columns (may already exist, ignore errors)
+DO $$ BEGIN
+    ALTER TABLE videos ADD COLUMN IF NOT EXISTS thumbnail_path VARCHAR(500);
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE series ADD COLUMN IF NOT EXISTS thumbnail_path VARCHAR(500);
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+
+-- Codec cache columns for faster video loading
+DO $$ BEGIN
+    ALTER TABLE videos ADD COLUMN IF NOT EXISTS video_codec VARCHAR(30);
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE videos ADD COLUMN IF NOT EXISTS audio_codec VARCHAR(30);
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE videos ADD COLUMN IF NOT EXISTS needs_transcoding BOOLEAN;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;

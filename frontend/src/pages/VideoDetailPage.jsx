@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { getVideo, checkFavorite, toggleFavorite } from '../api';
-import { Play, Film, ArrowLeft, Heart } from 'lucide-react';
+import { getVideo, checkFavorite, toggleFavorite, getSubtitles, extractSubtitles, generateThumbnail, getThumbnailUrl, getSeriesThumbnailUrl } from '../api';
+import { Play, Film, ArrowLeft, Heart, Subtitles, Check, Loader, Image } from 'lucide-react';
 
 export default function VideoDetailPage() {
   const { id } = useParams();
@@ -9,6 +9,10 @@ export default function VideoDetailPage() {
   const [video, setVideo] = useState(null);
   const [loading, setLoading] = useState(true);
   const [favorited, setFavorited] = useState(false);
+  const [subs, setSubs] = useState([]);
+  const [subsLoading, setSubsLoading] = useState(false);
+  const [thumbLoading, setThumbLoading] = useState(false);
+  const [hasThumb, setHasThumb] = useState(false);
 
   useEffect(() => {
     Promise.all([getVideo(id), checkFavorite({ video_id: id })])
@@ -18,6 +22,15 @@ export default function VideoDetailPage() {
       })
       .catch(console.error)
       .finally(() => setLoading(false));
+
+    // Check existing subtitles
+    getSubtitles(id).then(res => setSubs(res.data || [])).catch(() => {});
+
+    // Check if thumbnail exists
+    const img = new window.Image();
+    img.onload = () => setHasThumb(true);
+    img.onerror = () => setHasThumb(false);
+    img.src = getThumbnailUrl(id);
   }, [id]);
 
   const handleToggleFavorite = async () => {
@@ -26,6 +39,31 @@ export default function VideoDetailPage() {
       setFavorited(res.data.favorited);
     } catch (err) {
       console.error('Favorite error:', err);
+    }
+  };
+
+  const handleExtractSubs = async () => {
+    setSubsLoading(true);
+    try {
+      await extractSubtitles(id);
+      const res = await getSubtitles(id);
+      setSubs(res.data || []);
+    } catch (err) {
+      console.error('Subtitle extraction error:', err);
+    } finally {
+      setSubsLoading(false);
+    }
+  };
+
+  const handleGenerateThumb = async () => {
+    setThumbLoading(true);
+    try {
+      await generateThumbnail(id);
+      setHasThumb(true);
+    } catch (err) {
+      console.error('Thumbnail error:', err);
+    } finally {
+      setThumbLoading(false);
     }
   };
 
@@ -41,11 +79,12 @@ export default function VideoDetailPage() {
     <div>
       <div className="detail-hero">
         <div className="detail-poster">
-          {video.poster_path ? (
-            <img src={`/api/images/${video.poster_path}`} alt={video.title} />
-          ) : (
-            <div className="placeholder-poster"><Film size={48} /></div>
-          )}
+          <img
+            src={getThumbnailUrl(video.id)}
+            alt={video.title}
+            onError={(e) => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex'; }}
+          />
+          <div className="placeholder-poster" style={{ display: 'none' }}><Film size={48} /></div>
         </div>
         <div className="detail-info">
           <button
@@ -78,6 +117,32 @@ export default function VideoDetailPage() {
             >
               <Heart size={18} fill={favorited ? 'white' : 'none'} />
               {favorited ? 'En favoritos' : 'Favorito'}
+            </button>
+            <button
+              className={`btn ${subs.length > 0 ? 'btn-success' : 'btn-secondary'} btn-subs`}
+              onClick={handleExtractSubs}
+              disabled={subsLoading}
+            >
+              {subsLoading ? (
+                <><Loader size={18} className="spin" /> Extrayendo...</>
+              ) : subs.length > 0 ? (
+                <><Check size={18} /> Subtítulos ({subs.length})</>
+              ) : (
+                <><Subtitles size={18} /> Subtítulos</>
+              )}
+            </button>
+            <button
+              className={`btn ${hasThumb ? 'btn-success' : 'btn-secondary'} btn-subs`}
+              onClick={handleGenerateThumb}
+              disabled={thumbLoading}
+            >
+              {thumbLoading ? (
+                <><Loader size={18} className="spin" /> Generando...</>
+              ) : hasThumb ? (
+                <><Check size={18} /> Carátula</>
+              ) : (
+                <><Image size={18} /> Carátula</>
+              )}
             </button>
           </div>
           <div style={{ marginTop: 16, fontSize: 13, color: 'var(--text-muted)' }}>

@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
@@ -11,17 +13,27 @@ const videosRoutes = require('./routes/videos');
 const librariesRoutes = require('./routes/libraries');
 const favoritesRoutes = require('./routes/favorites');
 const usersRoutes = require('./routes/users');
+const subtitlesRoutes = require('./routes/subtitles');
+
+const { startSubtitleCron } = require('./services/subtitleCron');
+const httpLogger = require('./middleware/httpLogger');
 
 const app = express();
 const PORT = process.env.PORT || 5566;
 
 // Middleware
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: false,
+}));
+app.use(compression());
 app.use(cors({
   origin: ['http://localhost:3344', 'http://localhost:5173'],
   credentials: true,
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(httpLogger);
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -42,16 +54,18 @@ app.use('/api/videos', authenticateToken, videosRoutes);
 app.use('/api/libraries', authenticateToken, librariesRoutes);
 app.use('/api/favorites', authenticateToken, favoritesRoutes);
 app.use('/api/users', authenticateToken, usersRoutes);
+app.use('/api/subtitles', authenticateToken, subtitlesRoutes);
 
 // Serve video thumbnails / posters from disk
 app.get('/api/images/*', authenticateToken, (req, res) => {
-  const imagePath = req.params[0];
-  if (!imagePath || imagePath.includes('..')) {
+  let imagePath = decodeURIComponent(req.params[0]);
+  if (!imagePath || imagePath.includes('..') || imagePath.includes('\0')) {
     return res.status(400).json({ error: 'Invalid path' });
   }
 
   // The image path is stored as absolute in db
   if (fs.existsSync(imagePath)) {
+    res.setHeader('Cache-Control', 'public, max-age=604800'); // 7 days
     res.sendFile(imagePath);
   } else {
     res.status(404).json({ error: 'Image not found' });
@@ -70,14 +84,14 @@ app.get('/api/search', authenticateToken, async (req, res) => {
 
     const [moviesResult, seriesResult] = await Promise.all([
       pool.query(`
-        SELECT v.id, v.title, v.poster_path, v.year, v.video_type
+        SELECT v.id, v.title, v.poster_path, v.thumbnail_path, v.year, v.video_type
         FROM videos v
         WHERE v.title ILIKE $1 AND v.video_type = 'movie'
         ORDER BY v.title ASC
         LIMIT 20
       `, [searchTerm]),
       pool.query(`
-        SELECT s.id, s.title, s.poster_path, s.year,
+        SELECT s.id, s.title, s.poster_path, s.thumbnail_path, s.year,
           (SELECT COUNT(*) FROM videos WHERE series_id = s.id) as episode_count
         FROM series s
         WHERE s.title ILIKE $1
@@ -105,7 +119,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       pool.query('SELECT COUNT(*) as count FROM series'),
       pool.query('SELECT COUNT(*) as count FROM libraries'),
       pool.query(`
-        SELECT v.id, v.title, v.video_type, v.poster_path, v.created_at,
+        SELECT v.id, v.title, v.video_type, v.poster_path, v.thumbnail_path, v.created_at,
                s.title as series_title, se.season_number, v.episode_number
         FROM videos v
         LEFT JOIN series s ON v.series_id = s.id
@@ -113,7 +127,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         ORDER BY v.created_at DESC LIMIT 12
       `),
       pool.query(`
-        SELECT v.id, v.title, v.video_type, v.poster_path, wp.progress_seconds, wp.last_watched_at,
+        SELECT v.id, v.title, v.video_type, v.poster_path, v.thumbnail_path, wp.progress_seconds, wp.last_watched_at,
                s.title as series_title, se.season_number, v.episode_number
         FROM watch_progress wp
         JOIN videos v ON wp.video_id = v.id
@@ -151,4 +165,11 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🎬 ubeFlix API running on port ${PORT}`);
   console.log(`   Health: http://localhost:${PORT}/api/health`);
   console.log(`   Videos path: ${process.env.VIDEOS_PATH || './videos'}\n`);
+
+  // Start subtitle download cron job
+  if (process.env.OPENSUBTITLES_API_KEY) {
+    startSubtitleCron();
+  } else {
+    console.log('⚠️  OPENSUBTITLES_API_KEY not set — subtitle cron disabled');
+  }
 });

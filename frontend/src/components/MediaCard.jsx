@@ -1,12 +1,14 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Play, Film, Tv, Heart } from 'lucide-react';
-import { toggleFavorite } from '../api';
+import { toggleFavorite, getThumbnailUrl, getSeriesThumbnailUrl } from '../api';
 
 export default function MediaCard({ item, type = 'movie', showProgress = false, isFavorited = false, onFavoriteToggle }) {
   const navigate = useNavigate();
   const [favorited, setFavorited] = useState(isFavorited);
   const [favLoading, setFavLoading] = useState(false);
+
+  const [imgError, setImgError] = useState(false);
 
   const handleClick = () => {
     if (type === 'series' || item.video_type === 'series') {
@@ -43,11 +45,35 @@ export default function MediaCard({ item, type = 'movie', showProgress = false, 
   if (item.episode_count) meta.push(`${item.episode_count} episodios`);
   if (item.season_count) meta.push(`${item.season_count} temporadas`);
 
+  // Determine poster image source
+  // Priority: thumbnail endpoint (clean URL) > poster_path (may have special chars)
+  const getPosterSrc = () => {
+    if (type === 'series' || item.video_type === 'series') {
+      return getSeriesThumbnailUrl(item.id);
+    }
+    // If thumbnail_path exists, use the clean thumbnail endpoint
+    if (item.thumbnail_path) {
+      return getThumbnailUrl(item.id);
+    }
+    // Fallback to poster_path with proper encoding
+    if (item.poster_path) {
+      return '/api/images/' + encodeURI(item.poster_path);
+    }
+    // Last resort: try thumbnail endpoint anyway
+    return getThumbnailUrl(item.id);
+  };
+  const posterSrc = getPosterSrc();
+
   return (
     <div className="media-card" onClick={handleClick}>
       <div className="media-card-poster">
-        {item.poster_path ? (
-          <img src={`/api/images/${item.poster_path}`} alt={title} loading="lazy" />
+        {!imgError ? (
+          <img
+            src={posterSrc}
+            alt={title}
+            loading="lazy"
+            onError={() => setImgError(true)}
+          />
         ) : (
           <div className="placeholder-icon">
             {type === 'series' ? <Tv size={40} /> : <Film size={40} />}

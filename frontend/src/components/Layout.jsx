@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { searchAll } from '../api';
+import ProgressToast from './ProgressToast';
 import {
   Home, Film, Tv, FolderOpen, Search, LogOut, Play, Settings,
   Heart, Users, Menu, X
@@ -233,6 +234,8 @@ export default function Layout() {
           <Outlet />
         </main>
       </div>
+
+      <ProgressToast />
     </div>
   );
 }

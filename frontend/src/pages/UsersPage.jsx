@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { getUsers, updateUser, deleteUser } from '../api';
 import { Users, Shield, ShieldOff, Trash2, Edit3, X, Save } from 'lucide-react';
+import Swal from 'sweetalert2';
 
 export default function UsersPage() {
   const [users, setUsers] = useState([]);
@@ -31,7 +32,16 @@ export default function UsersPage() {
   };
 
   const handleDelete = async (user) => {
-    if (!window.confirm(`¿Estás seguro de eliminar al usuario "${user.username}"?`)) return;
+    const result = await Swal.fire({
+      title: '¿Eliminar usuario?',
+      text: `Se eliminará al usuario "${user.username}".`,
+      icon: 'warning',
+      showCancelButton: true,
+      confirmButtonText: 'Eliminar',
+      cancelButtonText: 'Cancelar',
+      confirmButtonColor: '#ef4444',
+    });
+    if (!result.isConfirmed) return;
     try {
       setError('');
       await deleteUser(user.id);

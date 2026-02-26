@@ -40,8 +40,17 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       PORT: ${PORT}
       VIDEOS_PATH: /videos
+      OPENSUBTITLES_API_KEY: ${OPENSUBTITLES_API_KEY:-l9hgHOSfuyQr64vw73UKk1EgADh3D0hi}
+      OPENSUBTITLES_USER: ${OPENSUBTITLES_USER:-drakocox}
+      OPENSUBTITLES_PASS: ${OPENSUBTITLES_PASS:-15829807vane}
     volumes:
       - ./videos:/videos:ro
+      # Unidades del PC montadas en /host (auto-montadas por WSL2 vía fstab)
+      - /mnt/host:/host:ro
+      # Persistent storage for generated thumbnails and subtitles
+      - ubeflix_thumbs:/tmp/ubeflix-thumbs
+      - ubeflix_subs:/tmp/ubeflix-subs
+      - ubeflix_logs:/tmp/ubeflix-logs
     depends_on:
       db:
         condition: service_healthy
@@ -65,6 +74,9 @@ services:
 
 volumes:
   postgres_data:
+  ubeflix_thumbs:
+  ubeflix_subs:
+  ubeflix_logs:
 
 networks:
   ubeflix-network:

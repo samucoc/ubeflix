@@ -15,6 +15,7 @@ const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
 // Expected: /SeriesName/Season 01/Episode01.mkv
 // Or:       /SeriesName/S01E01 - Episode Title.mkv
 // Or:       /SeriesName/Season 1/S01E01.mkv
+// Or:       /SeriesName/SubFolder/Episode01.mkv  (subfolder as season)
 function parseSeriesInfo(filePath, libraryPath) {
   const relative = path.relative(libraryPath, filePath);
   const parts = relative.split(path.sep);
@@ -28,13 +29,19 @@ function parseSeriesInfo(filePath, libraryPath) {
   let episodeNumber = null;
   let episodeTitle = '';
   let seasonFolder = null;
+  let subfolderName = null;
 
-  // Check if there's a season folder
+  // Check if there's a season/subfolder
   if (parts.length >= 3) {
     seasonFolder = parts[1];
+    subfolderName = parts[1];
     const seasonMatch = seasonFolder.match(/(?:season|temporada|s)\s*(\d+)/i);
     if (seasonMatch) {
       seasonNumber = parseInt(seasonMatch[1]);
+    } else {
+      // Subfolder that isn't a standard season folder — treat as season 1
+      // but keep the subfolder name for grouping
+      seasonNumber = 1;
     }
   }
 
@@ -91,6 +98,7 @@ function parseSeriesInfo(filePath, libraryPath) {
     seriesFolder,
     seasonNumber,
     seasonFolder,
+    subfolderName,
     episodeNumber,
     episodeTitle: episodeTitle || `Episodio ${episodeNumber}`,
   };
@@ -207,37 +215,66 @@ async function scanLibrary(library) {
   }
 
   const videoFiles = findVideoFiles(libraryPath);
-  console.log(`Found ${videoFiles.length} video files`);
+  console.log(`Found ${videoFiles.length} video files on disk`);
+
+  // Build a set of current file paths on disk for fast lookup
+  const diskPaths = new Set(videoFiles);
 
   let added = 0;
+  let removed = 0;
+  let updated = 0;
   let skipped = 0;
   let errors = 0;
 
   if (library.library_type === 'series') {
-    added = await scanSeriesLibrary(library, videoFiles, libraryPath);
+    const result = await scanSeriesLibrary(library, videoFiles, libraryPath, diskPaths);
+    added = result.added;
+    removed = result.removed;
+    updated = result.updated;
+    skipped = result.skipped;
   } else {
-    // Movies
+    // === MOVIES ===
+
+    // 1. Remove videos whose files no longer exist on disk
+    const existingVideos = await pool.query(
+      'SELECT id, file_path, title FROM videos WHERE library_id = $1',
+      [library.id]
+    );
+
+    for (const row of existingVideos.rows) {
+      if (!diskPaths.has(row.file_path)) {
+        await pool.query('DELETE FROM videos WHERE id = $1', [row.id]);
+        removed++;
+        console.log(`  🗑️  Removed movie: ${row.title} (file missing)`);
+      }
+    }
+
+    // 2. Add new / update existing videos
+    const existingPaths = new Set(existingVideos.rows.map(r => r.file_path));
+
     for (const filePath of videoFiles) {
       try {
-        // Check if already exists
-        const existing = await pool.query('SELECT id FROM videos WHERE file_path = $1', [filePath]);
-        if (existing.rows.length > 0) {
-          skipped++;
-          continue;
-        }
-
         const info = parseMovieInfo(filePath);
         const dir = path.dirname(filePath);
         const images = findImages(dir);
         const fileSize = getFileSize(filePath);
 
-        await pool.query(`
-          INSERT INTO videos (title, original_filename, file_path, file_size, video_type, year, poster_path, banner_path, library_id)
-          VALUES ($1, $2, $3, $4, 'movie', $5, $6, $7, $8)
-        `, [info.title, path.basename(filePath), filePath, fileSize, info.year, images.poster, images.banner, library.id]);
-
-        added++;
-        console.log(`  ✅ Added movie: ${info.title}${info.year ? ` (${info.year})` : ''}`);
+        if (existingPaths.has(filePath)) {
+          // Update existing entry (poster, size, etc.)
+          await pool.query(`
+            UPDATE videos SET title = $1, file_size = $2, poster_path = COALESCE($3, poster_path), 
+            banner_path = COALESCE($4, banner_path), year = COALESCE($5, year)
+            WHERE file_path = $6
+          `, [info.title, fileSize, images.poster, images.banner, info.year, filePath]);
+          updated++;
+        } else {
+          await pool.query(`
+            INSERT INTO videos (title, original_filename, file_path, file_size, video_type, year, poster_path, banner_path, library_id)
+            VALUES ($1, $2, $3, $4, 'movie', $5, $6, $7, $8)
+          `, [info.title, path.basename(filePath), filePath, fileSize, info.year, images.poster, images.banner, library.id]);
+          added++;
+          console.log(`  ✅ Added movie: ${info.title}${info.year ? ` (${info.year})` : ''}`);
+        }
       } catch (err) {
         errors++;
         console.error(`  ❌ Error processing ${filePath}:`, err.message);
@@ -245,12 +282,56 @@ async function scanLibrary(library) {
     }
   }
 
-  console.log(`\n📊 Scan complete: ${added} added, ${skipped} skipped, ${errors} errors`);
-  return { added, skipped, errors };
+  console.log(`\n📊 Scan complete: ${added} added, ${updated} updated, ${removed} removed, ${skipped} skipped, ${errors} errors`);
+  return { added, updated, removed, skipped, errors };
 }
 
-async function scanSeriesLibrary(library, videoFiles, libraryPath) {
+async function scanSeriesLibrary(library, videoFiles, libraryPath, diskPaths) {
   let added = 0;
+  let removed = 0;
+  let updated = 0;
+  let skipped = 0;
+
+  // 1. Remove episodes whose files no longer exist
+  const existingEpisodes = await pool.query(
+    'SELECT id, file_path, title, series_id, season_id FROM videos WHERE library_id = $1',
+    [library.id]
+  );
+
+  const removedSeriesIds = new Set();
+  const removedSeasonIds = new Set();
+
+  for (const row of existingEpisodes.rows) {
+    if (!diskPaths.has(row.file_path)) {
+      await pool.query('DELETE FROM videos WHERE id = $1', [row.id]);
+      removed++;
+      if (row.series_id) removedSeriesIds.add(row.series_id);
+      if (row.season_id) removedSeasonIds.add(row.season_id);
+      console.log(`  🗑️  Removed episode: ${row.title} (file missing)`);
+    }
+  }
+
+  // Clean up empty seasons (no episodes left)
+  for (const seasonId of removedSeasonIds) {
+    const count = await pool.query('SELECT COUNT(*) as c FROM videos WHERE season_id = $1', [seasonId]);
+    if (parseInt(count.rows[0].c) === 0) {
+      await pool.query('DELETE FROM seasons WHERE id = $1', [seasonId]);
+      console.log(`  🗑️  Removed empty season id=${seasonId}`);
+    }
+  }
+
+  // Clean up empty series (no episodes left)
+  for (const seriesId of removedSeriesIds) {
+    const count = await pool.query('SELECT COUNT(*) as c FROM videos WHERE series_id = $1', [seriesId]);
+    if (parseInt(count.rows[0].c) === 0) {
+      await pool.query('DELETE FROM seasons WHERE series_id = $1', [seriesId]);
+      await pool.query('DELETE FROM series WHERE id = $1', [seriesId]);
+      console.log(`  🗑️  Removed empty series id=${seriesId}`);
+    }
+  }
+
+  // 2. Add new episodes / update existing
+  const existingPaths = new Set(existingEpisodes.rows.map(r => r.file_path));
 
   // Group files by series
   const seriesMap = new Map();
@@ -294,23 +375,55 @@ async function scanSeriesLibrary(library, videoFiles, libraryPath) {
         console.log(`  📺 Created series: ${seriesTitle}`);
       } else {
         seriesId = seriesResult.rows[0].id;
+        // Update series images if found new ones
+        if (seriesImages.poster || seriesImages.banner) {
+          await pool.query(
+            'UPDATE series SET poster_path = COALESCE($1, poster_path), banner_path = COALESCE($2, banner_path) WHERE id = $3',
+            [seriesImages.poster, seriesImages.banner, seriesId]
+          );
+        }
       }
 
-      // Group episodes by season
+      // Group episodes by season (use subfolder name as key when present)
       const seasonMap = new Map();
       for (const ep of seriesData.episodes) {
-        if (!seasonMap.has(ep.seasonNumber)) {
-          seasonMap.set(ep.seasonNumber, []);
+        // Use subfolderName as grouping key if it exists and is NOT a standard season folder
+        const isStandardSeason = ep.seasonFolder && /(?:season|temporada|s)\s*\d+/i.test(ep.seasonFolder);
+        const seasonKey = ep.subfolderName && !isStandardSeason
+          ? `sub_${ep.subfolderName}`
+          : String(ep.seasonNumber);
+        if (!seasonMap.has(seasonKey)) {
+          seasonMap.set(seasonKey, { episodes: [], seasonNumber: ep.seasonNumber, subfolderName: ep.subfolderName, seasonFolder: ep.seasonFolder });
         }
-        seasonMap.get(ep.seasonNumber).push(ep);
+        seasonMap.get(seasonKey).episodes.push(ep);
       }
 
-      for (const [seasonNum, episodes] of seasonMap) {
+      // Auto-number seasons when there are multiple subfolder-based groups
+      let autoSeasonNum = 0;
+      const sortedSeasonKeys = [...seasonMap.keys()].sort();
+
+      for (const seasonKey of sortedSeasonKeys) {
+        autoSeasonNum++;
+        const group = seasonMap.get(seasonKey);
+        const episodes = group.episodes;
+        const isSubfolder = seasonKey.startsWith('sub_');
+        const seasonNum = isSubfolder ? autoSeasonNum : group.seasonNumber;
+        const seasonTitle = isSubfolder ? cleanTitle(group.subfolderName) : `Temporada ${seasonNum}`;
+
         // Find or create season
-        let seasonResult = await pool.query(
-          'SELECT id FROM seasons WHERE series_id = $1 AND season_number = $2',
-          [seriesId, seasonNum]
-        );
+        let seasonResult;
+        if (isSubfolder) {
+          // For subfolder-based seasons, match by title + series
+          seasonResult = await pool.query(
+            'SELECT id FROM seasons WHERE series_id = $1 AND title = $2',
+            [seriesId, seasonTitle]
+          );
+        } else {
+          seasonResult = await pool.query(
+            'SELECT id FROM seasons WHERE series_id = $1 AND season_number = $2',
+            [seriesId, seasonNum]
+          );
+        }
 
         let seasonId;
         if (seasonResult.rows.length === 0) {
@@ -318,30 +431,35 @@ async function scanSeriesLibrary(library, videoFiles, libraryPath) {
             ? path.join(seriesFolder, episodes[0].seasonFolder)
             : seriesFolder;
 
-          const seasonImages = findImages(seasonFolderPath);
-
           seasonResult = await pool.query(
             'INSERT INTO seasons (series_id, season_number, title, folder_path) VALUES ($1, $2, $3, $4) RETURNING id',
-            [seriesId, seasonNum, `Temporada ${seasonNum}`, seasonFolderPath]
+            [seriesId, seasonNum, seasonTitle, seasonFolderPath]
           );
           seasonId = seasonResult.rows[0].id;
-          console.log(`    📂 Created season ${seasonNum}`);
+          console.log(`    📂 Created season: ${seasonTitle} (#${seasonNum})`);
         } else {
           seasonId = seasonResult.rows[0].id;
+          // Update season number if needed
+          await pool.query('UPDATE seasons SET season_number = $1 WHERE id = $2', [seasonNum, seasonId]);
         }
 
-        // Add episodes
+        // Add/update episodes
         for (const ep of episodes) {
-          const existing = await pool.query('SELECT id FROM videos WHERE file_path = $1', [ep.filePath]);
-          if (existing.rows.length > 0) continue;
-
-          await pool.query(`
-            INSERT INTO videos (title, original_filename, file_path, file_size, video_type, series_id, season_id, episode_number, library_id)
-            VALUES ($1, $2, $3, $4, 'episode', $5, $6, $7, $8)
-          `, [ep.episodeTitle, path.basename(ep.filePath), ep.filePath, ep.fileSize, seriesId, seasonId, ep.episodeNumber, library.id]);
-
-          added++;
-          console.log(`      ✅ S${String(seasonNum).padStart(2, '0')}E${String(ep.episodeNumber).padStart(2, '0')} - ${ep.episodeTitle}`);
+          if (existingPaths.has(ep.filePath)) {
+            // Update existing
+            await pool.query(`
+              UPDATE videos SET title = $1, file_size = $2, series_id = $3, season_id = $4, episode_number = $5
+              WHERE file_path = $6
+            `, [ep.episodeTitle, ep.fileSize, seriesId, seasonId, ep.episodeNumber, ep.filePath]);
+            updated++;
+          } else {
+            await pool.query(`
+              INSERT INTO videos (title, original_filename, file_path, file_size, video_type, series_id, season_id, episode_number, library_id)
+              VALUES ($1, $2, $3, $4, 'episode', $5, $6, $7, $8)
+            `, [ep.episodeTitle, path.basename(ep.filePath), ep.filePath, ep.fileSize, seriesId, seasonId, ep.episodeNumber, library.id]);
+            added++;
+            console.log(`      ✅ S${String(seasonNum).padStart(2, '0')}E${String(ep.episodeNumber).padStart(2, '0')} - ${ep.episodeTitle}`);
+          }
         }
       }
     } catch (err) {
@@ -349,7 +467,7 @@ async function scanSeriesLibrary(library, videoFiles, libraryPath) {
     }
   }
 
-  return added;
+  return { added, removed, updated, skipped };
 }
 
 module.exports = { scanLibrary, parseMovieInfo, parseSeriesInfo, findVideoFiles };

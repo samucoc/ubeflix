@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { getSeriesDetail, checkFavorite, toggleFavorite } from '../api';
-import { Play, Tv, ArrowLeft, Heart } from 'lucide-react';
+import { getSeriesDetail, checkFavorite, toggleFavorite, batchCheckSubtitles, extractSubtitles, getSeriesThumbnailUrl } from '../api';
+import { Play, Tv, ArrowLeft, Heart, Subtitles, Check, Loader } from 'lucide-react';
 
 export default function SeriesDetailPage() {
   const { id } = useParams();
@@ -10,6 +10,9 @@ export default function SeriesDetailPage() {
   const [loading, setLoading] = useState(true);
   const [activeSeason, setActiveSeason] = useState(0);
   const [favorited, setFavorited] = useState(false);
+  const [episodeSubs, setEpisodeSubs] = useState({});
+  const [extractingEp, setExtractingEp] = useState(null);
+  const [subsChecked, setSubsChecked] = useState(new Set());
 
   useEffect(() => {
     Promise.all([getSeriesDetail(id), checkFavorite({ series_id: id })])
@@ -20,6 +23,46 @@ export default function SeriesDetailPage() {
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [id]);
+
+  // Load subtitle counts for all episodes in current season with ONE batch call
+  useEffect(() => {
+    if (!series) return;
+    const seasons = series.seasons || [];
+    const currentSeason = seasons[activeSeason];
+    const episodes = currentSeason?.episodes || [];
+    const uncheckedIds = episodes.map(ep => ep.id).filter(epId => !subsChecked.has(epId));
+    if (uncheckedIds.length === 0) return;
+
+    batchCheckSubtitles(uncheckedIds).then(res => {
+      const counts = res.data || {};
+      setEpisodeSubs(prev => {
+        const next = { ...prev };
+        for (const [vid, count] of Object.entries(counts)) {
+          next[vid] = count;
+        }
+        return next;
+      });
+      setSubsChecked(prev => {
+        const next = new Set(prev);
+        uncheckedIds.forEach(id => next.add(id));
+        return next;
+      });
+    }).catch(() => {});
+  }, [series, activeSeason]);
+
+  const handleExtractEpSubs = async (epId, e) => {
+    e.stopPropagation();
+    setExtractingEp(epId);
+    try {
+      const res = await extractSubtitles(epId);
+      const total = (res.data?.embedded || 0) + (res.data?.external || 0);
+      setEpisodeSubs(prev => ({ ...prev, [epId]: (prev[epId] || 0) + total }));
+    } catch (err) {
+      console.error('Subtitle extraction error:', err);
+    } finally {
+      setExtractingEp(null);
+    }
+  };
 
   const handleToggleFavorite = async () => {
     try {
@@ -49,11 +92,12 @@ export default function SeriesDetailPage() {
       {/* Hero */}
       <div className="detail-hero">
         <div className="detail-poster">
-          {series.poster_path ? (
-            <img src={`/api/images/${series.poster_path}`} alt={series.title} />
-          ) : (
-            <div className="placeholder-poster"><Tv size={48} /></div>
-          )}
+          <img
+            src={getSeriesThumbnailUrl(series.id)}
+            alt={series.title}
+            onError={(e) => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex'; }}
+          />
+          <div className="placeholder-poster" style={{ display: 'none' }}><Tv size={48} /></div>
         </div>
         <div className="detail-info">
           <button
@@ -102,30 +146,49 @@ export default function SeriesDetailPage() {
                 className={`season-tab ${idx === activeSeason ? 'active' : ''}`}
                 onClick={() => setActiveSeason(idx)}
               >
-                Temporada {season.season_number}
+                {season.title || `Temporada ${season.season_number}`}
               </button>
             ))}
           </div>
 
           {/* Episode list */}
           <div className="episode-list">
-            {episodes.map((ep) => (
-              <div
-                key={ep.id}
-                className="episode-item"
-                onClick={() => navigate(`/player/${ep.id}`)}
-              >
-                <div className="episode-number">{ep.episode_number}</div>
-                <div className="episode-info">
-                  <div className="episode-title">{ep.title}</div>
-                  <div className="episode-meta">
-                    {ep.original_filename}
-                    {ep.file_size && ` · ${(ep.file_size / (1024 * 1024 * 1024)).toFixed(1)} GB`}
+            {episodes.map((ep) => {
+              const subCount = episodeSubs[ep.id] || 0;
+              const hasSubs = subCount > 0;
+              const isExtracting = extractingEp === ep.id;
+              return (
+                <div
+                  key={ep.id}
+                  className="episode-item"
+                  onClick={() => navigate(`/player/${ep.id}`)}
+                >
+                  <div className="episode-number">{ep.episode_number}</div>
+                  <div className="episode-info">
+                    <div className="episode-title">{ep.title}</div>
+                    <div className="episode-meta">
+                      {ep.original_filename}
+                      {ep.file_size && ` · ${(ep.file_size / (1024 * 1024 * 1024)).toFixed(1)} GB`}
+                    </div>
                   </div>
+                  <button
+                    className={`btn-icon-subs ${hasSubs ? 'has-subs' : ''}`}
+                    title={hasSubs ? `${subCount} subtítulo(s)` : 'Extraer subtítulos'}
+                    onClick={(e) => handleExtractEpSubs(ep.id, e)}
+                    disabled={isExtracting}
+                  >
+                    {isExtracting ? (
+                      <Loader size={16} className="spin" />
+                    ) : hasSubs ? (
+                      <Check size={16} />
+                    ) : (
+                      <Subtitles size={16} />
+                    )}
+                  </button>
+                  <div className="episode-play"><Play size={20} /></div>
                 </div>
-                <div className="episode-play"><Play size={20} /></div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </>
       )}

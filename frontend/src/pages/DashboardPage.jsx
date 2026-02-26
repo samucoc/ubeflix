@@ -1,8 +1,26 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getDashboard } from '../api';
-import { Film, Tv, MonitorPlay, FolderOpen } from 'lucide-react';
+import { Film, Tv, MonitorPlay, FolderOpen, ChevronLeft, ChevronRight } from 'lucide-react';
 import MediaCard from '../components/MediaCard';
+
+function MediaRow({ children }) {
+  const rowRef = useRef(null);
+
+  const scroll = useCallback((dir) => {
+    if (!rowRef.current) return;
+    const amount = rowRef.current.clientWidth * 0.75;
+    rowRef.current.scrollBy({ left: dir === 'left' ? -amount : amount, behavior: 'smooth' });
+  }, []);
+
+  return (
+    <div className="media-row-wrapper">
+      <button className="media-row-btn left" onClick={() => scroll('left')}><ChevronLeft size={22} /></button>
+      <div className="media-row" ref={rowRef}>{children}</div>
+      <button className="media-row-btn right" onClick={() => scroll('right')}><ChevronRight size={22} /></button>
+    </div>
+  );
+}
 
 export default function DashboardPage() {
   const [data, setData] = useState(null);
@@ -68,11 +86,11 @@ export default function DashboardPage() {
           <div className="section-header">
             <h2 className="section-title">Continuar viendo</h2>
           </div>
-          <div className="media-row">
+          <MediaRow>
             {continueWatching.map((item) => (
               <MediaCard key={item.id} item={item} showProgress={true} />
             ))}
-          </div>
+          </MediaRow>
         </div>
       )}
 
@@ -83,11 +101,11 @@ export default function DashboardPage() {
             <h2 className="section-title">Agregados recientemente</h2>
             <span className="section-link" onClick={() => navigate('/movies')}>Ver todo</span>
           </div>
-          <div className="media-row">
+          <MediaRow>
             {recentlyAdded.map((item) => (
               <MediaCard key={item.id} item={item} />
             ))}
-          </div>
+          </MediaRow>
         </div>
       )}
 

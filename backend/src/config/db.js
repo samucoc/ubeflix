@@ -6,14 +6,14 @@ const pool = new Pool({
   database: process.env.DB_NAME || 'ubeflix',
   user: process.env.DB_USER || 'ubeflix_user',
   password: process.env.DB_PASSWORD,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  max: 10,
+  idleTimeoutMillis: 60000,
+  connectionTimeoutMillis: 10000,
+  allowExitOnIdle: false,
 });
 
 pool.on('error', (err) => {
-  console.error('Unexpected error on idle client', err);
-  process.exit(-1);
+  console.error('Pool idle client error (non-fatal):', err.message);
 });
 
 module.exports = { pool };
