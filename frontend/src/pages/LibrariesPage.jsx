@@ -1,17 +1,18 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { getLibraries, createLibrary, deleteLibrary, scanLibrary, browseDirectories, generateLibraryThumbnails, extractLibrarySubtitles, autoOpenSubtitlesLibrary } from '../api';
-import { FolderOpen, Plus, Trash2, RefreshCw, X, Folder, ChevronRight, ArrowUp, Search, Check, Image, Subtitles, Globe } from 'lucide-react';
+import { getLibraries, createLibrary, updateLibrary, deleteLibrary, scanLibrary, browseDirectories, generateLibraryThumbnails, extractLibrarySubtitles, autoOpenSubtitlesLibrary, getRemountConfig, remountDrive } from '../api';
+import { FolderOpen, Plus, Trash2, RefreshCw, X, Folder, ChevronRight, ArrowUp, Search, Check, Image, Subtitles, Globe, Pencil } from 'lucide-react';
 import Swal from 'sweetalert2';
 
 export default function LibrariesPage() {
   const [libraries, setLibraries] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
+  const [editingLibrary, setEditingLibrary] = useState(null);
   const [scanning, setScanning] = useState({});
   const [generatingThumbs, setGeneratingThumbs] = useState({});
   const [extractingSubs, setExtractingSubs] = useState({});
   const [searchingOpenSub, setSearchingOpenSub] = useState({});
-  const [form, setForm] = useState({ name: '', path: '', library_type: 'movies' });
+  const [form, setForm] = useState({ name: '', paths: [], library_type: 'movies' });
   const [error, setError] = useState('');
 
   // Folder browser state
@@ -21,6 +22,7 @@ export default function LibrariesPage() {
   const [loadingBrowse, setLoadingBrowse] = useState(false);
   const [browseError, setBrowseError] = useState('');
   const [manualPath, setManualPath] = useState('/host');
+  const [reconnecting, setReconnecting] = useState('');
 
   const loadLibraries = () => {
     getLibraries()
@@ -40,7 +42,6 @@ export default function LibrariesPage() {
       setParentPath(res.data.parent);
       setDirectories(res.data.directories);
       setManualPath(res.data.current);
-      setForm((prev) => ({ ...prev, path: res.data.current }));
     } catch (err) {
       setBrowseError(err.response?.data?.error || 'Error al explorar el directorio');
     } finally {
@@ -48,27 +49,120 @@ export default function LibrariesPage() {
     }
   }, []);
 
+  // Detect the Windows drive letter involved in the current browse error, so we
+  // can offer a "reconnect" button. Prefer the backend message ("El disco H:"),
+  // fall back to the path being browsed (/host/h/...).
+  const disconnectedDrive = (() => {
+    const m1 = /disco\s+([a-zA-Z]):/i.exec(browseError || '');
+    if (m1) return m1[1].toUpperCase();
+    const m2 = /^\/host\/([a-zA-Z])(?:\/|$)/i.exec(manualPath || '');
+    if (m2 && /desconect|no\s+such|no\s+existe|explorar/i.test(browseError || '')) return m2[1].toUpperCase();
+    return '';
+  })();
+
+  const handleReconnect = useCallback(async (letter) => {
+    setReconnecting(letter);
+    try {
+      const { data: cfg } = await getRemountConfig();
+      if (!cfg.url) {
+        setBrowseError(`El agente de remontaje no está configurado. Corré remount-host-drive.ps1 ${letter} en el host.`);
+        return;
+      }
+      await remountDrive(cfg, letter);
+      setBrowseError('');
+      await loadDirectory(`/host/${letter.toLowerCase()}`);
+      Swal.fire({
+        icon: 'success', title: `Disco ${letter}: reconectado`,
+        toast: true, position: 'top-end', showConfirmButton: false, timer: 3000,
+      });
+    } catch (err) {
+      const agentMsg = err.response?.data?.error;
+      if (agentMsg) {
+        // The agent answered (e.g. drive still not plugged into Windows).
+        setBrowseError(agentMsg);
+      } else {
+        // Network error: agent not running, or we're on a remote client where
+        // "localhost" is not the host machine.
+        setBrowseError(
+          `No se pudo contactar el agente de remontaje. Iniciálo en la máquina host ` +
+          `(host-agent/start-agent.cmd) o corré remount-host-drive.ps1 ${letter}.`
+        );
+      }
+    } finally {
+      setReconnecting('');
+    }
+  }, [loadDirectory]);
+
   const openModal = () => {
+    setEditingLibrary(null);
     setShowModal(true);
-    setForm({ name: '', path: '', library_type: 'movies' });
+    setForm({ name: '', paths: [], library_type: 'movies' });
     setError('');
     loadDirectory('/host');
   };
 
-  const handleCreate = async (e) => {
+  const openEditModal = (lib) => {
+    const existingPaths = Array.isArray(lib.locations) && lib.locations.length > 0
+      ? lib.locations
+      : (lib.path ? [lib.path] : []);
+
+    setEditingLibrary(lib);
+    setShowModal(true);
+    setForm({
+      name: lib.name || '',
+      paths: [...new Set(existingPaths)],
+      library_type: lib.library_type || 'movies',
+    });
+    setError('');
+    loadDirectory('/host');
+  };
+
+  const addCurrentPath = () => {
+    setForm((prev) => {
+      if (prev.paths.includes(currentPath)) return prev;
+      return { ...prev, paths: [...prev.paths, currentPath] };
+    });
+  };
+
+  const removePath = (pathToRemove) => {
+    setForm((prev) => ({
+      ...prev,
+      paths: prev.paths.filter((p) => p !== pathToRemove),
+    }));
+  };
+
+  const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
-    if (!form.path) {
-      setError('Seleccioná una carpeta');
+    if (!form.paths.length) {
+      setError('Agregá al menos una ubicación');
       return;
     }
     try {
-      await createLibrary(form);
+      if (editingLibrary) {
+        await updateLibrary(editingLibrary.id, {
+          name: form.name,
+          locations: form.paths,
+        });
+      } else {
+        await createLibrary({
+          name: form.name,
+          library_type: form.library_type,
+          locations: form.paths,
+        });
+      }
       setShowModal(false);
-      setForm({ name: '', path: '', library_type: 'movies' });
+      setEditingLibrary(null);
+      setForm({ name: '', paths: [], library_type: 'movies' });
       loadLibraries();
+      Swal.fire({
+        title: editingLibrary ? 'Biblioteca actualizada' : 'Biblioteca creada',
+        icon: 'success',
+        timer: 1500,
+        showConfirmButton: false,
+      });
     } catch (err) {
-      setError(err.response?.data?.error || 'Error al crear biblioteca');
+      setError(err.response?.data?.error || 'Error al guardar biblioteca');
     }
   };
 
@@ -212,11 +306,20 @@ export default function LibrariesPage() {
             <tbody>
               {libraries.map((lib) => (
                 <tr key={lib.id}>
-                  <td style={{ fontWeight: 500 }}>{lib.name}</td>
-                  <td style={{ color: 'var(--text-muted)', fontFamily: 'monospace', fontSize: 13 }}>{lib.path}</td>
+                  <td style={{ fontWeight: 500 }}>
+                    <span style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6 }} onClick={() => openEditModal(lib)} title="Clic para editar nombre y rutas">
+                      {lib.name}
+                      <Pencil size={13} style={{ color: 'var(--text-muted)', opacity: 0.5 }} />
+                    </span>
+                  </td>
+                  <td style={{ color: 'var(--text-muted)', fontFamily: 'monospace', fontSize: 13 }}>
+                    {Array.isArray(lib.locations) && lib.locations.length > 0
+                      ? `${lib.locations[0]}${lib.locations.length > 1 ? ` (+${lib.locations.length - 1})` : ''}`
+                      : lib.path}
+                  </td>
                   <td>
                     <span className={`badge badge-${lib.library_type}`}>
-                      {lib.library_type === 'movies' ? 'Películas' : 'Series'}
+                      {lib.library_type === 'movies' ? 'Películas' : lib.library_type === 'series' ? 'Series' : 'Comics'}
                     </span>
                   </td>
                   <td style={{ color: 'var(--text-muted)' }}>
@@ -227,6 +330,14 @@ export default function LibrariesPage() {
                   </td>
                   <td>
                     <div style={{ display: 'flex', gap: 4 }}>
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => openEditModal(lib)}
+                        title="Editar biblioteca"
+                      >
+                        <Pencil size={14} />
+                        Editar
+                      </button>
                       <button
                         className="btn btn-secondary btn-sm"
                         onClick={() => handleScan(lib.id)}
@@ -282,16 +393,18 @@ export default function LibrariesPage() {
 
       {/* Add Library Modal */}
       {showModal && (
-        <div className="modal-overlay" onClick={() => setShowModal(false)}>
+        <div className="modal-overlay" onClick={() => { setShowModal(false); setEditingLibrary(null); }}>
           <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 680 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-              <h2 className="modal-title" style={{ marginBottom: 0 }}>Agregar Biblioteca</h2>
-              <button className="btn-icon" onClick={() => setShowModal(false)}><X size={20} /></button>
+              <h2 className="modal-title" style={{ marginBottom: 0 }}>
+                {editingLibrary ? 'Editar Biblioteca' : 'Agregar Biblioteca'}
+              </h2>
+              <button className="btn-icon" onClick={() => { setShowModal(false); setEditingLibrary(null); }}><X size={20} /></button>
             </div>
 
             {error && <div className="login-error">{error}</div>}
 
-            <form onSubmit={handleCreate}>
+            <form onSubmit={handleSubmit}>
               {/* Row: Name + Type */}
               <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
                 <div className="form-group" style={{ flex: 2, marginBottom: 0 }}>
@@ -311,9 +424,11 @@ export default function LibrariesPage() {
                     className="form-select"
                     value={form.library_type}
                     onChange={(e) => setForm({ ...form, library_type: e.target.value })}
+                    disabled={!!editingLibrary}
                   >
                     <option value="movies">Películas</option>
                     <option value="series">Series</option>
+                    <option value="comics">Comics</option>
                   </select>
                 </div>
               </div>
@@ -322,7 +437,7 @@ export default function LibrariesPage() {
               <div className="form-group">
                 <label className="form-label">
                   <FolderOpen size={14} style={{ verticalAlign: -2, marginRight: 6 }} />
-                  Seleccionar carpeta
+                  Navegar carpetas
                 </label>
 
                 {/* Manual path input */}
@@ -342,8 +457,20 @@ export default function LibrariesPage() {
                 </div>
 
                 {browseError && (
-                  <div style={{ color: '#ef4444', fontSize: 13, padding: '6px 10px', background: 'rgba(239,68,68,0.1)', borderRadius: 6, marginBottom: 8 }}>
-                    {browseError}
+                  <div style={{ color: '#ef4444', fontSize: 13, padding: '8px 10px', background: 'rgba(239,68,68,0.1)', borderRadius: 6, marginBottom: 8, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                    <span style={{ flex: 1, minWidth: 180 }}>{browseError}</span>
+                    {disconnectedDrive && (
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleReconnect(disconnectedDrive)}
+                        disabled={!!reconnecting}
+                        style={{ whiteSpace: 'nowrap', flexShrink: 0 }}
+                      >
+                        <RefreshCw size={14} className={reconnecting ? 'spin' : undefined} />
+                        {reconnecting === disconnectedDrive ? `Reconectando ${disconnectedDrive}:…` : `Reconectar disco ${disconnectedDrive}:`}
+                      </button>
+                    )}
                   </div>
                 )}
 
@@ -356,13 +483,21 @@ export default function LibrariesPage() {
                 }}>
                   <FolderOpen size={14} style={{ flexShrink: 0, color: 'var(--primary)' }} />
                   <span style={{ fontWeight: 500, color: 'var(--text-primary)' }}>{currentPath}</span>
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    onClick={addCurrentPath}
+                    style={{ marginLeft: 'auto', flexShrink: 0 }}
+                  >
+                    <Check size={14} /> Agregar ubicación
+                  </button>
                   {parentPath && (
                     <button
                       type="button"
                       className="btn btn-secondary btn-sm"
                       onClick={handleGoUp}
                       title="Ir a carpeta superior"
-                      style={{ marginLeft: 'auto', flexShrink: 0 }}
+                      style={{ flexShrink: 0 }}
                     >
                       <ArrowUp size={14} /> Subir
                     </button>
@@ -410,17 +545,33 @@ export default function LibrariesPage() {
                   )}
                 </div>
 
-                {/* Selected path indicator */}
-                {form.path && (
+                {/* Selected locations */}
+                {form.paths.length > 0 && (
                   <div style={{
-                    display: 'flex', alignItems: 'center', gap: 8,
+                    display: 'flex', flexDirection: 'column', gap: 8,
                     marginTop: 10, padding: '8px 12px',
                     background: 'rgba(34, 197, 94, 0.08)', border: '1px solid rgba(34, 197, 94, 0.3)',
                     borderRadius: 8, fontSize: 13,
                   }}>
-                    <Check size={16} style={{ color: '#22c55e', flexShrink: 0 }} />
-                    <span style={{ color: 'var(--text-muted)' }}>Carpeta seleccionada:</span>
-                    <span style={{ fontFamily: 'monospace', fontWeight: 500, color: 'var(--text-primary)' }}>{form.path}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <Check size={16} style={{ color: '#22c55e', flexShrink: 0 }} />
+                      <span style={{ color: 'var(--text-muted)' }}>Ubicaciones seleccionadas:</span>
+                    </div>
+                    {form.paths.map((selectedPath) => (
+                      <div key={selectedPath} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ fontFamily: 'monospace', fontWeight: 500, color: 'var(--text-primary)', flex: 1 }}>
+                          {selectedPath}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          onClick={() => removePath(selectedPath)}
+                          title="Quitar ubicación"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -429,8 +580,8 @@ export default function LibrariesPage() {
                 <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>
                   Cancelar
                 </button>
-                <button type="submit" className="btn btn-primary" disabled={!form.path || !form.name}>
-                  <Plus size={16} /> Crear biblioteca
+                <button type="submit" className="btn btn-primary" disabled={!form.paths.length || !form.name}>
+                  <Plus size={16} /> {editingLibrary ? 'Guardar cambios' : 'Crear biblioteca'}
                 </button>
               </div>
             </form>

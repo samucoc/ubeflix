@@ -3,20 +3,22 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../config/db');
 const { requireAdmin } = require('../middleware/auth');
 
+const { asyncHandler } = require('../utils/asyncHandler');
+
+const { requireNumericParams } = require('../utils/params');
+
 const router = express.Router();
 
+// Los ids de ruta van directo a la base: validarlos acá evita un 500 por `/api/x/abc`.
+requireNumericParams(router, 'id');
+
 // GET /api/users — List all users (admin only)
-router.get('/', requireAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT id, username, email, is_admin, avatar_url, created_at, updated_at FROM users ORDER BY created_at DESC'
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Get users error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-});
+router.get('/', requireAdmin, asyncHandler(async (req, res) => {
+  const result = await pool.query(
+    'SELECT id, username, email, is_admin, avatar_url, created_at, updated_at FROM users ORDER BY created_at DESC'
+  );
+  res.json(result.rows);
+}));
 
 // PUT /api/users/:id — Update user (admin only)
 router.put('/:id', requireAdmin, async (req, res) => {
@@ -74,26 +76,21 @@ router.put('/:id', requireAdmin, async (req, res) => {
 });
 
 // DELETE /api/users/:id — Delete user (admin only)
-router.delete('/:id', requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
+router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
+  const { id } = req.params;
 
-    // Prevent admin from deleting themselves
-    if (parseInt(id) === req.user.id) {
-      return res.status(400).json({ error: 'No puedes eliminar tu propia cuenta' });
-    }
-
-    const existing = await pool.query('SELECT id FROM users WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Usuario no encontrado' });
-    }
-
-    await pool.query('DELETE FROM users WHERE id = $1', [id]);
-    res.json({ message: 'Usuario eliminado' });
-  } catch (err) {
-    console.error('Delete user error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
+  // Prevent admin from deleting themselves
+  if (parseInt(id) === req.user.id) {
+    return res.status(400).json({ error: 'No puedes eliminar tu propia cuenta' });
   }
-});
+
+  const existing = await pool.query('SELECT id FROM users WHERE id = $1', [id]);
+  if (existing.rows.length === 0) {
+    return res.status(404).json({ error: 'Usuario no encontrado' });
+  }
+
+  await pool.query('DELETE FROM users WHERE id = $1', [id]);
+  res.json({ message: 'Usuario eliminado' });
+}));
 
 module.exports = router;

@@ -39,18 +39,41 @@ services:
       DB_PASSWORD: ${POSTGRES_PASSWORD}
       JWT_SECRET: ${JWT_SECRET}
       PORT: ${PORT}
+      TRUST_PROXY: ${TRUST_PROXY:-uniquelocal}
+      # Admin inicial: solo se aplica si la DB no tiene usuarios todavía
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@ubeflix.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       VIDEOS_PATH: /videos
-      OPENSUBTITLES_API_KEY: ${OPENSUBTITLES_API_KEY:-l9hgHOSfuyQr64vw73UKk1EgADh3D0hi}
-      OPENSUBTITLES_USER: ${OPENSUBTITLES_USER:-drakocox}
-      OPENSUBTITLES_PASS: ${OPENSUBTITLES_PASS:-15829807vane}
+      # Sin valores por defecto: las credenciales viven solo en .env (nunca en el repo)
+      OPENSUBTITLES_API_KEY: ${OPENSUBTITLES_API_KEY:-}
+      OPENSUBTITLES_USER: ${OPENSUBTITLES_USER:-}
+      OPENSUBTITLES_PASS: ${OPENSUBTITLES_PASS:-}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      MUSIC_PATH: /music
+      # Stable staging area for torrent downloads (native ext4 volume, not a flaky
+      # 9p/USB mount) — the finished video is moved to the library location afterwards.
+      DOWNLOADS_PATH: /downloads
+      # Agente de remontaje en el host (reconectar unidades desde la app)
+      REMOUNT_AGENT_URL: ${REMOUNT_AGENT_URL:-http://localhost:9797}
+      REMOUNT_AGENT_TOKEN: ${REMOUNT_AGENT_TOKEN:-}
+      HLS_CACHE_TTL_MS: ${HLS_CACHE_TTL_MS:-2700000}
+      HLS_CLEANUP_INTERVAL_MS: ${HLS_CLEANUP_INTERVAL_MS:-600000}
+      HLS_CACHE_MAX_BYTES: ${HLS_CACHE_MAX_BYTES:-21474836480}
     volumes:
-      - ./videos:/videos:ro
+      # Escritura habilitada para permitir descargas de torrent dentro de las bibliotecas
+      - ./videos:/videos
+      - ubeflix_music:/music
       # Unidades del PC montadas en /host (auto-montadas por WSL2 vía fstab)
-      - /mnt/host:/host:ro
+      # Montado con escritura para que el cliente de torrents pueda guardar en las carpetas de películas
+      - /mnt/host:/host
       # Persistent storage for generated thumbnails and subtitles
       - ubeflix_thumbs:/tmp/ubeflix-thumbs
       - ubeflix_subs:/tmp/ubeflix-subs
       - ubeflix_logs:/tmp/ubeflix-logs
+      - ubeflix_hls:/tmp/ubeflix-hls
+      - ubeflix_downloads:/downloads
     depends_on:
       db:
         condition: service_healthy
@@ -77,6 +100,9 @@ volumes:
   ubeflix_thumbs:
   ubeflix_subs:
   ubeflix_logs:
+  ubeflix_music:
+  ubeflix_hls:
+  ubeflix_downloads:
 
 networks:
   ubeflix-network:

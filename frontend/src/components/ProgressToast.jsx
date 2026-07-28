@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Image, Subtitles, CheckCircle, XCircle, Loader } from 'lucide-react';
+import { Image, Subtitles, CheckCircle, XCircle, Loader, Download } from 'lucide-react';
+import usePolling from '../hooks/usePolling';
 
 const API_URL = import.meta.env.VITE_API_URL || '/api';
 
@@ -25,14 +26,12 @@ export default function ProgressToast() {
     } catch {}
   }, []);
 
-  useEffect(() => {
-    pollActiveTasks();
-    pollingRef.current = setInterval(pollActiveTasks, 5000);
-    return () => {
-      clearInterval(pollingRef.current);
-      Object.values(eventSourcesRef.current).forEach((es) => es.close());
-    };
-  }, [pollActiveTasks]);
+  // Las tareas en curso llegan por SSE; esto sólo descubre tareas nuevas.
+  usePolling(pollActiveTasks, { interval: 5000 });
+
+  useEffect(() => () => {
+    Object.values(eventSourcesRef.current).forEach((es) => es.close());
+  }, []);
 
   const subscribeToTask = useCallback((taskId) => {
     if (eventSourcesRef.current[taskId]) return;
@@ -94,6 +93,8 @@ export default function ProgressToast() {
                 <XCircle size={18} />
               ) : task.type === 'thumbs' ? (
                 <Image size={18} className="spin" />
+              ) : task.type === 'torrent' ? (
+                <Download size={18} className="spin" />
               ) : (
                 <Subtitles size={18} className="spin" />
               )}

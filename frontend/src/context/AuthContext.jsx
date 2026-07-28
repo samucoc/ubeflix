@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { login as apiLogin, register as apiRegister, getMe } from '../api';
+import { login as apiLogin, register as apiRegister, getMe, refreshMediaToken, clearMediaToken } from '../api';
 
 const AuthContext = createContext(null);
 
@@ -15,6 +15,7 @@ export function AuthProvider({ children }) {
         .catch(() => {
           localStorage.removeItem('ubeflix_token');
           localStorage.removeItem('ubeflix_user');
+          clearMediaToken();
         })
         .finally(() => setLoading(false));
     } else {
@@ -27,6 +28,8 @@ export function AuthProvider({ children }) {
     const { user: userData, token } = res.data;
     localStorage.setItem('ubeflix_token', token);
     localStorage.setItem('ubeflix_user', JSON.stringify(userData));
+    clearMediaToken();
+    refreshMediaToken();
     setUser(userData);
     return userData;
   };
@@ -36,6 +39,8 @@ export function AuthProvider({ children }) {
     const { user: userData, token } = res.data;
     localStorage.setItem('ubeflix_token', token);
     localStorage.setItem('ubeflix_user', JSON.stringify(userData));
+    clearMediaToken();
+    refreshMediaToken();
     setUser(userData);
     return userData;
   };
@@ -43,6 +48,7 @@ export function AuthProvider({ children }) {
   const logout = () => {
     localStorage.removeItem('ubeflix_token');
     localStorage.removeItem('ubeflix_user');
+    clearMediaToken();
     setUser(null);
   };
 

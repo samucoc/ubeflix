@@ -11,6 +11,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const unzipper = require('unzipper');
 const { pool } = require('../config/db');
+const { normalizeSubtitleFileInPlace } = require('./subtitleEncoding');
 
 const SUBS_DIR = '/tmp/ubeflix-subs';
 const SUBDIVX_BASE = 'https://www.subdivx.com';
@@ -425,6 +426,10 @@ async function processDownloadedSubtitle(buffer, subdivxId, videoId, videoSubDir
     const ext = path.extname(srtFile).toLowerCase();
     let vttPath = srtFile;
     let format = ext.substring(1);
+
+    if (ext === '.srt' || ext === '.vtt') {
+      try { normalizeSubtitleFileInPlace(srtFile, ext === '.vtt' ? 'vtt' : 'srt'); } catch {}
+    }
 
     if (['.srt', '.ass', '.ssa'].includes(ext)) {
       vttPath = srtFile.replace(/\.[^.]+$/, '.vtt');

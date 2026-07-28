@@ -18,9 +18,31 @@ const {
   SUBS_DIR,
   THUMBS_DIR,
 } = require('../services/subtitles');
+const {
+  decodeSubtitleBuffer,
+  toVttTextFromDecoded,
+  normalizeSubtitleBufferToUtf8,
+} = require('../services/subtitleEncoding');
 const progress = require('../services/progress');
 
+const { asyncHandler } = require('../utils/asyncHandler');
+
+const { requireNumericParams } = require('../utils/params');
+
 const router = express.Router();
+
+// Los ids de ruta van directo a la base: validarlos acá evita un 500 por `/api/x/abc`.
+requireNumericParams(router, 'videoId', 'libraryId', 'seriesId', 'subId');
+
+// Las carátulas se piden una por tarjeta de la grilla: fuera del event loop.
+async function fileExists(filePath) {
+  try {
+    await fs.promises.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ===== SSE PROGRESS =====
 
@@ -56,186 +78,172 @@ router.get('/progress/active', (req, res) => {
 // ===== THUMBNAILS (must be before /:videoId to avoid conflict) =====
 
 // POST /api/subtitles/thumbnails/generate/:videoId
-router.post('/thumbnails/generate/:videoId', async (req, res) => {
-  try {
-    const { videoId } = req.params;
-    const videoResult = await pool.query('SELECT file_path FROM videos WHERE id = $1', [videoId]);
+router.post('/thumbnails/generate/:videoId', asyncHandler(async (req, res) => {
+  const { videoId } = req.params;
+  const videoResult = await pool.query('SELECT file_path FROM videos WHERE id = $1', [videoId]);
 
-    if (videoResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Video no encontrado' });
-    }
-
-    const filePath = videoResult.rows[0].file_path;
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'Archivo no encontrado' });
-    }
-
-    const thumbPath = await generateThumbnail(videoId, filePath);
-    if (thumbPath) {
-      res.json({ message: 'Thumbnail generado', thumbnail_path: thumbPath });
-    } else {
-      res.status(500).json({ error: 'No se pudo generar el thumbnail' });
-    }
-  } catch (err) {
-    console.error('Generate thumbnail error:', err);
-    res.status(500).json({ error: 'Error al generar thumbnail' });
+  if (videoResult.rows.length === 0) {
+    return res.status(404).json({ error: 'Video no encontrado' });
   }
-});
+
+  const filePath = videoResult.rows[0].file_path;
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Archivo no encontrado' });
+  }
+
+  const thumbPath = await generateThumbnail(videoId, filePath);
+  if (thumbPath) {
+    res.json({ message: 'Thumbnail generado', thumbnail_path: thumbPath });
+  } else {
+    res.status(500).json({ error: 'No se pudo generar el thumbnail' });
+  }
+}));
 
 // POST /api/subtitles/thumbnails/library/:libraryId
-router.post('/thumbnails/library/:libraryId', requireAdmin, async (req, res) => {
-  try {
-    const { libraryId } = req.params;
-    const taskId = `thumbs:${libraryId}:${Date.now()}`;
+router.post('/thumbnails/library/:libraryId', requireAdmin, asyncHandler(async (req, res) => {
+  const { libraryId } = req.params;
+  const taskId = `thumbs:${libraryId}:${Date.now()}`;
 
-    // Count videos that need thumbnails
-    const countResult = await pool.query(
-      'SELECT COUNT(*) as cnt FROM videos WHERE library_id = $1 AND thumbnail_path IS NULL',
+  // Count videos that need thumbnails
+  const countResult = await pool.query(
+    'SELECT COUNT(*) as cnt FROM videos WHERE library_id = $1 AND thumbnail_path IS NULL',
+    [libraryId]
+  );
+  const seriesCount = await pool.query(
+    `SELECT COUNT(*) as cnt FROM series WHERE library_id = $1 AND thumbnail_path IS NULL`,
+    [libraryId]
+  );
+  const total = parseInt(countResult.rows[0].cnt) + parseInt(seriesCount.rows[0].cnt);
+
+  if (total === 0) {
+    return res.json({ message: 'Todas las carátulas ya están generadas', taskId: null });
+  }
+
+  progress.createTask(taskId, `Generando carátulas (0/${total})`, total);
+  res.json({ message: 'Generación de carátulas iniciada', taskId });
+
+  // Run in background with progress
+  (async () => {
+    let done = 0;
+    const videos = await pool.query(
+      'SELECT id, file_path FROM videos WHERE library_id = $1 AND thumbnail_path IS NULL',
       [libraryId]
     );
-    const seriesCount = await pool.query(
-      `SELECT COUNT(*) as cnt FROM series WHERE library_id = $1 AND thumbnail_path IS NULL`,
-      [libraryId]
-    );
-    const total = parseInt(countResult.rows[0].cnt) + parseInt(seriesCount.rows[0].cnt);
-
-    if (total === 0) {
-      return res.json({ message: 'Todas las carátulas ya están generadas', taskId: null });
+    for (const video of videos.rows) {
+      if (!fs.existsSync(video.file_path)) { done++; progress.updateTask(taskId, done, { label: `Generando carátulas (${done}/${total})` }); continue; }
+      await generateThumbnail(video.id, video.file_path);
+      done++;
+      progress.updateTask(taskId, done, { label: `Generando carátulas (${done}/${total})` });
     }
 
-    progress.createTask(taskId, `Generando carátulas (0/${total})`, total);
-    res.json({ message: 'Generación de carátulas iniciada', taskId });
-
-    // Run in background with progress
-    (async () => {
-      let done = 0;
-      const videos = await pool.query(
-        'SELECT id, file_path FROM videos WHERE library_id = $1 AND thumbnail_path IS NULL',
-        [libraryId]
-      );
-      for (const video of videos.rows) {
-        if (!fs.existsSync(video.file_path)) { done++; progress.updateTask(taskId, done, { label: `Generando carátulas (${done}/${total})` }); continue; }
-        await generateThumbnail(video.id, video.file_path);
-        done++;
-        progress.updateTask(taskId, done, { label: `Generando carátulas (${done}/${total})` });
-      }
-
-      // Series thumbnails
-      const seriesResult = await pool.query(
-        `SELECT DISTINCT s.id as series_id,
-                (SELECT v.id FROM videos v WHERE v.series_id = s.id ORDER BY v.season_id, v.episode_number LIMIT 1) as first_episode_id
-         FROM series s
-         WHERE s.library_id = $1 AND s.thumbnail_path IS NULL`,
-        [libraryId]
-      );
-      for (const row of seriesResult.rows) {
-        if (!row.first_episode_id) { done++; progress.updateTask(taskId, done, { label: `Generando carátulas (${done}/${total})` }); continue; }
-        const vr = await pool.query('SELECT file_path FROM videos WHERE id = $1', [row.first_episode_id]);
-        if (vr.rows.length > 0 && fs.existsSync(vr.rows[0].file_path)) {
-          const seriesThumbPath = path.join(THUMBS_DIR, `series_${row.series_id}.jpg`);
-          if (!fs.existsSync(seriesThumbPath)) {
+    // Series thumbnails
+    const seriesResult = await pool.query(
+      `SELECT DISTINCT s.id as series_id,
+              (SELECT v.id FROM videos v WHERE v.series_id = s.id ORDER BY v.season_id, v.episode_number LIMIT 1) as first_episode_id
+       FROM series s
+       WHERE s.library_id = $1 AND s.thumbnail_path IS NULL`,
+      [libraryId]
+    );
+    for (const row of seriesResult.rows) {
+      if (!row.first_episode_id) { done++; progress.updateTask(taskId, done, { label: `Generando carátulas (${done}/${total})` }); continue; }
+      const vr = await pool.query('SELECT file_path FROM videos WHERE id = $1', [row.first_episode_id]);
+      if (vr.rows.length > 0 && fs.existsSync(vr.rows[0].file_path)) {
+        const seriesThumbPath = path.join(THUMBS_DIR, `series_${row.series_id}.jpg`);
+        if (!fs.existsSync(seriesThumbPath)) {
+          try {
+            let seekTo = '00:02:00';
             try {
-              let seekTo = '00:02:00';
-              try {
-                const { stdout } = await execFileAsync('ffprobe', [
-                  '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', vr.rows[0].file_path
-                ], { timeout: 10000 });
-                const sec = Math.floor(parseFloat(stdout.trim()) * 0.15);
-                const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-                seekTo = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-              } catch {}
-              await execFileAsync('ffmpeg', [
-                '-y', '-loglevel', 'error', '-ss', seekTo, '-i', vr.rows[0].file_path,
-                '-vframes', '1', '-q:v', '3', '-vf', 'scale=480:-1', seriesThumbPath
-              ], { timeout: 15000 });
-              if (fs.existsSync(seriesThumbPath)) {
-                await pool.query('UPDATE series SET thumbnail_path = $1 WHERE id = $2', [seriesThumbPath, row.series_id]);
-              }
+              const { stdout } = await execFileAsync('ffprobe', [
+                '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', vr.rows[0].file_path
+              ], { timeout: 10000 });
+              const sec = Math.floor(parseFloat(stdout.trim()) * 0.15);
+              const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+              seekTo = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
             } catch {}
-          }
+            await execFileAsync('ffmpeg', [
+              '-y', '-loglevel', 'error', '-ss', seekTo, '-i', vr.rows[0].file_path,
+              '-vframes', '1', '-q:v', '3', '-vf', 'scale=480:-1', seriesThumbPath
+            ], { timeout: 15000 });
+            if (fs.existsSync(seriesThumbPath)) {
+              await pool.query('UPDATE series SET thumbnail_path = $1 WHERE id = $2', [seriesThumbPath, row.series_id]);
+            }
+          } catch {}
         }
-        done++;
-        progress.updateTask(taskId, done, { label: `Generando carátulas (${done}/${total})` });
       }
+      done++;
+      progress.updateTask(taskId, done, { label: `Generando carátulas (${done}/${total})` });
+    }
 
-      progress.completeTask(taskId, `✅ Carátulas generadas (${done})`);
-      console.log(`✅ Generated thumbnails for library ${libraryId}: ${done}`);
-    })().catch(err => {
-      console.error('Library thumbnail generation error:', err);
-      progress.failTask(taskId, err.message);
-    });
-  } catch (err) {
-    console.error('Library thumbnail error:', err);
-    res.status(500).json({ error: 'Error al generar thumbnails' });
-  }
-});
+    progress.completeTask(taskId, `✅ Carátulas generadas (${done})`);
+    console.log(`✅ Generated thumbnails for library ${libraryId}: ${done}`);
+  })().catch(err => {
+    console.error('Library thumbnail generation error:', err);
+    progress.failTask(taskId, err.message);
+  });
+}));
 
 // POST /api/subtitles/library/:libraryId/extract-all - Extract subtitles for all videos in library
-router.post('/library/:libraryId/extract-all', requireAdmin, async (req, res) => {
-  try {
-    const { libraryId } = req.params;
-    const taskId = `subs:${libraryId}:${Date.now()}`;
+router.post('/library/:libraryId/extract-all', requireAdmin, asyncHandler(async (req, res) => {
+  const { libraryId } = req.params;
+  const taskId = `subs:${libraryId}:${Date.now()}`;
 
-    const videos = await pool.query(
-      `SELECT v.id, v.file_path FROM videos v
-       LEFT JOIN (SELECT video_id, COUNT(*) as cnt FROM subtitles GROUP BY video_id) s ON s.video_id = v.id
-       WHERE v.library_id = $1 AND (s.cnt IS NULL OR s.cnt = 0)`,
-      [libraryId]
-    );
+  const videos = await pool.query(
+    `SELECT v.id, v.file_path FROM videos v
+     LEFT JOIN (SELECT video_id, COUNT(*) as cnt FROM subtitles GROUP BY video_id) s ON s.video_id = v.id
+     WHERE v.library_id = $1 AND (s.cnt IS NULL OR s.cnt = 0)`,
+    [libraryId]
+  );
 
-    const total = videos.rows.length;
-    if (total === 0) {
-      return res.json({ message: 'Todos los videos ya tienen subtítulos', taskId: null });
-    }
-
-    progress.createTask(taskId, `Extrayendo subtítulos (0/${total})`, total);
-    res.json({ message: 'Extracción de subtítulos iniciada', taskId });
-
-    // Run in background with progress
-    (async () => {
-      let extracted = 0;
-      let done = 0;
-      for (const video of videos.rows) {
-        done++;
-        if (!fs.existsSync(video.file_path)) {
-          progress.updateTask(taskId, done, { label: `Extrayendo subtítulos (${done}/${total})` });
-          continue;
-        }
-        try {
-          const emb = await extractEmbeddedSubtitles(video.id, video.file_path);
-          const ext = await findExternalSubtitles(video.id, video.file_path);
-          if (emb.length + ext.length > 0) extracted++;
-        } catch (err) {
-          console.error(`Sub extraction error for video ${video.id}:`, err.message);
-        }
-        progress.updateTask(taskId, done, { label: `Extrayendo subtítulos (${done}/${total})` });
-      }
-      progress.completeTask(taskId, `✅ Subtítulos extraídos (${extracted}/${total})`);
-      console.log(`✅ Extracted subtitles for ${extracted}/${total} videos in library ${libraryId}`);
-    })().catch(err => {
-      console.error('Library subtitle extraction error:', err);
-      progress.failTask(taskId, err.message);
-    });
-  } catch (err) {
-    console.error('Library subtitle error:', err);
-    res.status(500).json({ error: 'Error al extraer subtítulos' });
+  const total = videos.rows.length;
+  if (total === 0) {
+    return res.json({ message: 'Todos los videos ya tienen subtítulos', taskId: null });
   }
-});
+
+  progress.createTask(taskId, `Extrayendo subtítulos (0/${total})`, total);
+  res.json({ message: 'Extracción de subtítulos iniciada', taskId });
+
+  // Run in background with progress
+  (async () => {
+    let extracted = 0;
+    let done = 0;
+    for (const video of videos.rows) {
+      done++;
+      if (!fs.existsSync(video.file_path)) {
+        progress.updateTask(taskId, done, { label: `Extrayendo subtítulos (${done}/${total})` });
+        continue;
+      }
+      try {
+        const emb = await extractEmbeddedSubtitles(video.id, video.file_path);
+        const ext = await findExternalSubtitles(video.id, video.file_path);
+        if (emb.length + ext.length > 0) extracted++;
+      } catch (err) {
+        console.error(`Sub extraction error for video ${video.id}:`, err.message);
+      }
+      progress.updateTask(taskId, done, { label: `Extrayendo subtítulos (${done}/${total})` });
+    }
+    progress.completeTask(taskId, `✅ Subtítulos extraídos (${extracted}/${total})`);
+    console.log(`✅ Extracted subtitles for ${extracted}/${total} videos in library ${libraryId}`);
+  })().catch(err => {
+    console.error('Library subtitle extraction error:', err);
+    progress.failTask(taskId, err.message);
+  });
+}));
 
 // GET /api/subtitles/thumbnails/file/:videoId
 router.get('/thumbnails/file/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
   let thumbPath = path.join(THUMBS_DIR, `${videoId}.jpg`);
-  if (!fs.existsSync(thumbPath)) {
+  if (!(await fileExists(thumbPath))) {
     thumbPath = path.join(THUMBS_DIR, `series_${videoId}.jpg`);
-    if (!fs.existsSync(thumbPath)) {
+    if (!(await fileExists(thumbPath))) {
       // Fallback: check poster_path in DB
       try {
         const result = await pool.query('SELECT poster_path FROM videos WHERE id = $1', [videoId]);
-        if (result.rows.length > 0 && result.rows[0].poster_path && fs.existsSync(result.rows[0].poster_path)) {
+        const poster = result.rows[0]?.poster_path;
+        if (poster && await fileExists(poster)) {
           res.setHeader('Cache-Control', 'public, max-age=86400');
-          return res.sendFile(result.rows[0].poster_path);
+          return res.sendFile(poster);
         }
       } catch {}
       return res.status(404).json({ error: 'Thumbnail no encontrado' });
@@ -252,22 +260,24 @@ router.get('/thumbnails/series/:seriesId', async (req, res) => {
   const { seriesId } = req.params;
   const thumbPath = path.join(THUMBS_DIR, `series_${seriesId}.jpg`);
 
-  if (fs.existsSync(thumbPath)) {
+  // Priority 1: poster_path from series folder (user-provided cover)
+  try {
+    const result = await pool.query('SELECT poster_path FROM series WHERE id = $1', [seriesId]);
+    const poster = result.rows[0]?.poster_path;
+    if (poster && await fileExists(poster)) {
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.sendFile(poster);
+    }
+  } catch {}
+
+  // Priority 2: auto-generated thumbnail
+  if (await fileExists(thumbPath)) {
     res.setHeader('Content-Type', 'image/jpeg');
     res.setHeader('Cache-Control', 'public, max-age=86400');
     return fs.createReadStream(thumbPath).pipe(res);
   }
 
-  // Fallback: check poster_path in series table
-  try {
-    const result = await pool.query('SELECT poster_path FROM series WHERE id = $1', [seriesId]);
-    if (result.rows.length > 0 && result.rows[0].poster_path && fs.existsSync(result.rows[0].poster_path)) {
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      return res.sendFile(result.rows[0].poster_path);
-    }
-  } catch {}
-
-  // Fallback: use thumbnail of first episode
+  // Priority 3: use thumbnail of first episode
   try {
     const ep = await pool.query(
       'SELECT id FROM videos WHERE series_id = $1 ORDER BY season_id, episode_number LIMIT 1',
@@ -354,185 +364,174 @@ router.post('/library/:libraryId/auto-opensubtitles', requireAdmin, async (req, 
 });
 
 // POST /api/subtitles/batch-check - Get subtitle counts for multiple video IDs at once
-router.post('/batch-check', async (req, res) => {
-  try {
-    const { videoIds } = req.body;
-    if (!Array.isArray(videoIds) || videoIds.length === 0) {
-      return res.json({});
-    }
-    // Limit to 200 IDs per request
-    const ids = videoIds.slice(0, 200).map(Number).filter(n => n > 0);
-    if (ids.length === 0) return res.json({});
-
-    const result = await pool.query(
-      `SELECT video_id, COUNT(*) as count
-       FROM subtitles
-       WHERE video_id = ANY($1)
-       GROUP BY video_id`,
-      [ids]
-    );
-
-    const counts = {};
-    for (const row of result.rows) {
-      counts[row.video_id] = parseInt(row.count);
-    }
-    // Fill missing IDs with 0
-    for (const id of ids) {
-      if (!(id in counts)) counts[id] = 0;
-    }
-    res.json(counts);
-  } catch (err) {
-    console.error('Batch check subtitles error:', err);
-    res.status(500).json({ error: 'Error interno' });
+router.post('/batch-check', asyncHandler(async (req, res) => {
+  const { videoIds } = req.body;
+  if (!Array.isArray(videoIds) || videoIds.length === 0) {
+    return res.json({});
   }
-});
+  // Limit to 200 IDs per request
+  const ids = videoIds.slice(0, 200).map(Number).filter(n => n > 0);
+  if (ids.length === 0) return res.json({});
+
+  const result = await pool.query(
+    `SELECT video_id, COUNT(*) as count
+     FROM subtitles
+     WHERE video_id = ANY($1)
+     GROUP BY video_id`,
+    [ids]
+  );
+
+  const counts = {};
+  for (const row of result.rows) {
+    counts[row.video_id] = parseInt(row.count);
+  }
+  // Fill missing IDs with 0
+  for (const id of ids) {
+    if (!(id in counts)) counts[id] = 0;
+  }
+  res.json(counts);
+}));
 
 // GET /api/subtitles/:videoId
-router.get('/:videoId', async (req, res) => {
-  try {
-    const { videoId } = req.params;
-    const result = await pool.query(
-      'SELECT * FROM subtitles WHERE video_id = $1 ORDER BY is_default DESC, label ASC',
-      [videoId]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Get subtitles error:', err);
-    res.status(500).json({ error: 'Error interno' });
-  }
-});
+router.get('/:videoId', asyncHandler(async (req, res) => {
+  const { videoId } = req.params;
+  const result = await pool.query(
+    'SELECT * FROM subtitles WHERE video_id = $1 ORDER BY is_default DESC, label ASC',
+    [videoId]
+  );
+  res.json(result.rows);
+}));
 
 // GET /api/subtitles/:videoId/file/:subId - Serve subtitle file (VTT)
-router.get('/:videoId/file/:subId', async (req, res) => {
-  try {
-    const { videoId, subId } = req.params;
-    const result = await pool.query(
-      'SELECT * FROM subtitles WHERE id = $1 AND video_id = $2',
-      [subId, videoId]
-    );
+router.get('/:videoId/file/:subId', asyncHandler(async (req, res) => {
+  const { videoId, subId } = req.params;
+  const result = await pool.query(
+    'SELECT * FROM subtitles WHERE id = $1 AND video_id = $2',
+    [subId, videoId]
+  );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Subtítulo no encontrado' });
-    }
+  if (result.rows.length === 0) {
+    return res.status(404).json({ error: 'Subtítulo no encontrado' });
+  }
 
-    const sub = result.rows[0];
-    if (!fs.existsSync(sub.file_path)) {
+  const sub = result.rows[0];
+
+  res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const ext = path.extname(sub.file_path).toLowerCase();
+  const isVtt = sub.format === 'vtt' || ext === '.vtt';
+  const isSrt = sub.format === 'srt' || ext === '.srt';
+
+  if (isVtt || isSrt) {
+    let raw;
+    try {
+      raw = await fs.promises.readFile(sub.file_path);
+    } catch {
       return res.status(404).json({ error: 'Archivo de subtítulo no encontrado' });
     }
-
-    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    fs.createReadStream(sub.file_path).pipe(res);
-  } catch (err) {
-    console.error('Serve subtitle error:', err);
-    res.status(500).json({ error: 'Error interno' });
+    const decoded = decodeSubtitleBuffer(raw);
+    const vttText = toVttTextFromDecoded(decoded, isVtt ? 'vtt' : 'srt');
+    return res.send(vttText);
   }
-});
+
+  // Fallback: serve as-is for non VTT/SRT formats.
+  const stream = fs.createReadStream(sub.file_path);
+  stream.on('error', () => {
+    if (!res.headersSent) res.status(404).json({ error: 'Archivo de subtítulo no encontrado' });
+    else res.end();
+  });
+  stream.pipe(res);
+}));
 
 // POST /api/subtitles/:videoId/extract - Extract embedded subtitles
-router.post('/:videoId/extract', async (req, res) => {
-  try {
-    const { videoId } = req.params;
+router.post('/:videoId/extract', asyncHandler(async (req, res) => {
+  const { videoId } = req.params;
 
-    // Skip if already extracted
-    const existing = await pool.query('SELECT COUNT(*) as count FROM subtitles WHERE video_id = $1', [videoId]);
-    if (parseInt(existing.rows[0].count) > 0) {
-      return res.json({ message: 'Subtítulos ya extraídos', embedded: 0, external: 0, skipped: true });
-    }
+  // Skip if already extracted
+  const existing = await pool.query('SELECT COUNT(*) as count FROM subtitles WHERE video_id = $1', [videoId]);
+  if (parseInt(existing.rows[0].count) > 0) {
+    return res.json({ message: 'Subtítulos ya extraídos', embedded: 0, external: 0, skipped: true });
+  }
 
-    const videoResult = await pool.query('SELECT file_path FROM videos WHERE id = $1', [videoId]);
+  const videoResult = await pool.query('SELECT file_path FROM videos WHERE id = $1', [videoId]);
+
+  if (videoResult.rows.length === 0) {
+    return res.status(404).json({ error: 'Video no encontrado' });
+  }
+
+  const filePath = videoResult.rows[0].file_path;
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Archivo de video no encontrado' });
+  }
+
+  console.log(`📝 Extracting subtitles from video ${videoId}`);
+
+  // Extract embedded + find external
+  const [embedded, external] = await Promise.all([
+    extractEmbeddedSubtitles(videoId, filePath),
+    findExternalSubtitles(videoId, filePath),
+  ]);
+
+  res.json({
+    message: `Encontrados ${embedded.length} embebidos y ${external.length} externos`,
+    embedded: embedded.length,
+    external: external.length,
+  });
+}));
+
+// POST /api/subtitles/:videoId/search - Search OpenSubtitles
+router.post('/:videoId/search', asyncHandler(async (req, res) => {
+  const { query } = req.body;
+  if (!query) {
+    // Use video title as default search
+    const videoResult = await pool.query(
+      `SELECT v.title, s.title as series_title, se.season_number, v.episode_number
+       FROM videos v
+       LEFT JOIN series s ON v.series_id = s.id
+       LEFT JOIN seasons se ON v.season_id = se.id
+       WHERE v.id = $1`,
+      [req.params.videoId]
+    );
 
     if (videoResult.rows.length === 0) {
       return res.status(404).json({ error: 'Video no encontrado' });
     }
 
-    const filePath = videoResult.rows[0].file_path;
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'Archivo de video no encontrado' });
+    const v = videoResult.rows[0];
+    let searchQuery = v.series_title || v.title;
+    if (v.season_number && v.episode_number) {
+      searchQuery += ` S${String(v.season_number).padStart(2, '0')}E${String(v.episode_number).padStart(2, '0')}`;
     }
 
-    console.log(`📝 Extracting subtitles from video ${videoId}`);
-
-    // Extract embedded + find external
-    const [embedded, external] = await Promise.all([
-      extractEmbeddedSubtitles(videoId, filePath),
-      findExternalSubtitles(videoId, filePath),
-    ]);
-
-    res.json({
-      message: `Encontrados ${embedded.length} embebidos y ${external.length} externos`,
-      embedded: embedded.length,
-      external: external.length,
-    });
-  } catch (err) {
-    console.error('Extract subtitles error:', err);
-    res.status(500).json({ error: 'Error al extraer subtítulos' });
+    const results = await searchOpenSubtitles(searchQuery);
+    return res.json({ query: searchQuery, results });
   }
-});
 
-// POST /api/subtitles/:videoId/search - Search OpenSubtitles
-router.post('/:videoId/search', async (req, res) => {
-  try {
-    const { query } = req.body;
-    if (!query) {
-      // Use video title as default search
-      const videoResult = await pool.query(
-        `SELECT v.title, s.title as series_title, se.season_number, v.episode_number
-         FROM videos v
-         LEFT JOIN series s ON v.series_id = s.id
-         LEFT JOIN seasons se ON v.season_id = se.id
-         WHERE v.id = $1`,
-        [req.params.videoId]
-      );
-
-      if (videoResult.rows.length === 0) {
-        return res.status(404).json({ error: 'Video no encontrado' });
-      }
-
-      const v = videoResult.rows[0];
-      let searchQuery = v.series_title || v.title;
-      if (v.season_number && v.episode_number) {
-        searchQuery += ` S${String(v.season_number).padStart(2, '0')}E${String(v.episode_number).padStart(2, '0')}`;
-      }
-
-      const results = await searchOpenSubtitles(searchQuery);
-      return res.json({ query: searchQuery, results });
-    }
-
-    const results = await searchOpenSubtitles(query);
-    res.json({ query, results });
-  } catch (err) {
-    console.error('Search subtitles error:', err);
-    res.status(500).json({ error: 'Error al buscar subtítulos' });
-  }
-});
+  const results = await searchOpenSubtitles(query);
+  res.json({ query, results });
+}));
 
 // POST /api/subtitles/:videoId/download - Download from OpenSubtitles
-router.post('/:videoId/download', async (req, res) => {
-  try {
-    const { videoId } = req.params;
-    const { file_id } = req.body;
+router.post('/:videoId/download', asyncHandler(async (req, res) => {
+  const { videoId } = req.params;
+  const { file_id } = req.body;
 
-    if (!file_id) {
-      return res.status(400).json({ error: 'file_id requerido' });
-    }
-
-    console.log(`📥 Downloading subtitle from OpenSubtitles: file_id=${file_id} for video ${videoId}`);
-    const result = await downloadOpenSubtitles(file_id, videoId);
-
-    if (result.success) {
-      res.json({
-        message: `Subtítulo descargado exitosamente`,
-        subtitles: result.subtitles,
-      });
-    } else {
-      res.status(500).json({ error: result.error || 'Error al descargar subtítulo' });
-    }
-  } catch (err) {
-    console.error('Download subtitle error:', err);
-    res.status(500).json({ error: 'Error al descargar subtítulo' });
+  if (!file_id) {
+    return res.status(400).json({ error: 'file_id requerido' });
   }
-});
+
+  console.log(`📥 Downloading subtitle from OpenSubtitles: file_id=${file_id} for video ${videoId}`);
+  const result = await downloadOpenSubtitles(file_id, videoId);
+
+  if (result.success) {
+    res.json({
+      message: `Subtítulo descargado exitosamente`,
+      subtitles: result.subtitles,
+    });
+  } else {
+    res.status(500).json({ error: result.error || 'Error al descargar subtítulo' });
+  }
+}));
 
 // POST /api/subtitles/:videoId/upload - Upload a subtitle file (admin only)
 const upload = multer({
@@ -545,85 +544,88 @@ const upload = multer({
   }
 });
 
-router.post('/:videoId/upload', requireAdmin, upload.single('subtitle'), async (req, res) => {
-  try {
-    const videoId = parseInt(req.params.videoId, 10);
-    if (isNaN(videoId)) return res.status(400).json({ error: 'ID inválido' });
-    if (!req.file) return res.status(400).json({ error: 'No se proporcionó archivo de subtítulo válido' });
-
-    const label = req.body.label || req.file.originalname.replace(/\.[^.]+$/, '');
-    const language = req.body.language || 'es';
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    const format = ext === '.srt' ? 'srt' : ext === '.vtt' ? 'vtt' : ext === '.ass' || ext === '.ssa' ? 'ass' : 'sub';
-
-    // Save file to subs directory
-    const videoSubDir = path.join(SUBS_DIR, String(videoId));
-    if (!fs.existsSync(videoSubDir)) fs.mkdirSync(videoSubDir, { recursive: true });
-
-    // If SRT, convert to VTT
-    let finalPath, finalFormat;
-    if (format === 'srt') {
-      const vttContent = 'WEBVTT\n\n' + req.file.buffer.toString('utf-8')
-        .replace(/\r\n/g, '\n')
-        .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
-      finalPath = path.join(videoSubDir, `upload_${Date.now()}.vtt`);
-      finalFormat = 'vtt';
-      fs.writeFileSync(finalPath, vttContent, 'utf-8');
-    } else {
-      finalPath = path.join(videoSubDir, `upload_${Date.now()}${ext}`);
-      finalFormat = format;
-      fs.writeFileSync(finalPath, req.file.buffer);
+// Multer rechaza por tamaño o tipo lanzando; sin esto el error viajaría al
+// middleware genérico y el usuario vería un 500 en vez de saber qué pasó.
+function handleUpload(req, res, next) {
+  upload.single('subtitle')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ error: 'El subtítulo supera los 5 MB' });
     }
+    if (err instanceof multer.MulterError) {
+      return res.status(400).json({ error: `Archivo inválido: ${err.code}` });
+    }
+    next(err);
+  });
+}
 
-    const result = await pool.query(
-      `INSERT INTO subtitles (video_id, label, language, format, file_path, source, is_default)
-       VALUES ($1, $2, $3, $4, $5, 'upload', false) RETURNING *`,
-      [videoId, label, language, finalFormat, finalPath]
-    );
+router.post('/:videoId/upload', requireAdmin, handleUpload, asyncHandler(async (req, res) => {
+  const videoId = parseInt(req.params.videoId, 10);
+  if (isNaN(videoId)) return res.status(400).json({ error: 'ID inválido' });
+  if (!req.file) return res.status(400).json({ error: 'No se proporcionó archivo de subtítulo válido' });
 
-    // Return updated subtitle list
-    const subs = await pool.query(
-      'SELECT id, video_id, label, language, format, source, is_default FROM subtitles WHERE video_id = $1 ORDER BY is_default DESC, id ASC',
-      [videoId]
-    );
-    res.json({ subtitle: result.rows[0], subtitles: subs.rows });
-  } catch (err) {
-    console.error('Upload subtitle error:', err);
-    res.status(500).json({ error: 'Error al subir subtítulo' });
+  const label = req.body.label || req.file.originalname.replace(/\.[^.]+$/, '');
+  const language = req.body.language || 'es';
+  const ext = path.extname(req.file.originalname).toLowerCase();
+  const format = ext === '.srt' ? 'srt' : ext === '.vtt' ? 'vtt' : ext === '.ass' || ext === '.ssa' ? 'ass' : 'sub';
+
+  // Save file to subs directory
+  const videoSubDir = path.join(SUBS_DIR, String(videoId));
+  if (!fs.existsSync(videoSubDir)) fs.mkdirSync(videoSubDir, { recursive: true });
+
+  // If SRT, convert to VTT
+  let finalPath, finalFormat;
+  if (format === 'srt' || format === 'vtt') {
+    const normalized = normalizeSubtitleBufferToUtf8(req.file.buffer, format);
+    finalPath = path.join(videoSubDir, `upload_${Date.now()}.vtt`);
+    finalFormat = 'vtt';
+    fs.writeFileSync(finalPath, normalized);
+  } else {
+    finalPath = path.join(videoSubDir, `upload_${Date.now()}${ext}`);
+    finalFormat = format;
+    fs.writeFileSync(finalPath, req.file.buffer);
   }
-});
+
+  const result = await pool.query(
+    `INSERT INTO subtitles (video_id, label, language, format, file_path, source, is_default)
+     VALUES ($1, $2, $3, $4, $5, 'upload', false) RETURNING *`,
+    [videoId, label, language, finalFormat, finalPath]
+  );
+
+  // Return updated subtitle list
+  const subs = await pool.query(
+    'SELECT id, video_id, label, language, format, source, is_default FROM subtitles WHERE video_id = $1 ORDER BY is_default DESC, id ASC',
+    [videoId]
+  );
+  res.json({ subtitle: result.rows[0], subtitles: subs.rows });
+}));
 
 // DELETE /api/subtitles/:videoId/:subId - Delete a subtitle (admin only)
-router.delete('/:videoId/:subId', requireAdmin, async (req, res) => {
-  try {
-    const videoId = parseInt(req.params.videoId, 10);
-    const subId = parseInt(req.params.subId, 10);
-    if (isNaN(videoId) || isNaN(subId)) return res.status(400).json({ error: 'ID inválido' });
+router.delete('/:videoId/:subId', requireAdmin, asyncHandler(async (req, res) => {
+  const videoId = parseInt(req.params.videoId, 10);
+  const subId = parseInt(req.params.subId, 10);
+  if (isNaN(videoId) || isNaN(subId)) return res.status(400).json({ error: 'ID inválido' });
 
-    const result = await pool.query(
-      'SELECT * FROM subtitles WHERE id = $1 AND video_id = $2',
-      [subId, videoId]
-    );
+  const result = await pool.query(
+    'SELECT * FROM subtitles WHERE id = $1 AND video_id = $2',
+    [subId, videoId]
+  );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Subtítulo no encontrado' });
-    }
-
-    // Delete file
-    const sub = result.rows[0];
-    try {
-      if (fs.existsSync(sub.file_path)) {
-        fs.unlinkSync(sub.file_path);
-      }
-    } catch {}
-
-    await pool.query('DELETE FROM subtitles WHERE id = $1', [subId]);
-    res.json({ message: 'Subtítulo eliminado' });
-  } catch (err) {
-    console.error('Delete subtitle error:', err);
-    res.status(500).json({ error: 'Error al eliminar subtítulo' });
+  if (result.rows.length === 0) {
+    return res.status(404).json({ error: 'Subtítulo no encontrado' });
   }
-});
+
+  // Delete file
+  const sub = result.rows[0];
+  try {
+    if (fs.existsSync(sub.file_path)) {
+      fs.unlinkSync(sub.file_path);
+    }
+  } catch {}
+
+  await pool.query('DELETE FROM subtitles WHERE id = $1', [subId]);
+  res.json({ message: 'Subtítulo eliminado' });
+}));
 
 // POST /api/subtitles/cron/run — Manually trigger subtitle download cron
 router.post('/cron/run', requireAdmin, async (req, res) => {

@@ -5,7 +5,7 @@ import { searchAll } from '../api';
 import ProgressToast from './ProgressToast';
 import {
   Home, Film, Tv, FolderOpen, Search, LogOut, Play, Settings,
-  Heart, Users, Menu, X
+  Heart, Users, Menu, X, Radio, Music, BookOpen
 } from 'lucide-react';
 
 export default function Layout() {
@@ -24,6 +24,9 @@ export default function Layout() {
     { path: '/movies', label: 'Películas', icon: Film },
     { path: '/series', label: 'Series', icon: Tv },
     { path: '/favorites', label: 'Favoritos', icon: Heart },
+    { path: '/live', label: 'TV en Vivo', icon: Radio },
+    { path: '/music', label: 'Música', icon: Music },
+    { path: '/comics', label: 'Comics', icon: BookOpen },
   ];
 
   const adminItems = [
@@ -124,6 +127,10 @@ export default function Layout() {
           </button>
         </div>
 
+        <button className="sidebar-expand-btn" onClick={() => setSidebarOpen(true)} data-tooltip="Menú">
+          <Menu size={20} />
+        </button>
+
         <nav className="sidebar-nav">
           <div className="sidebar-section">Media</div>
           {navItems.map((item) => (
@@ -131,9 +138,10 @@ export default function Layout() {
               key={item.path}
               className={`sidebar-item ${isActive(item.path) ? 'active' : ''}`}
               onClick={() => navigate(item.path)}
+              data-tooltip={item.label}
             >
               <item.icon size={20} />
-              {item.label}
+              <span className="sidebar-label">{item.label}</span>
             </button>
           ))}
 
@@ -145,9 +153,10 @@ export default function Layout() {
                   key={item.path}
                   className={`sidebar-item ${isActive(item.path) ? 'active' : ''}`}
                   onClick={() => navigate(item.path)}
+                  data-tooltip={item.label}
                 >
                   <item.icon size={20} />
-                  {item.label}
+                  <span className="sidebar-label">{item.label}</span>
                 </button>
               ))}
             </>

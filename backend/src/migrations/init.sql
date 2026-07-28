@@ -22,6 +22,16 @@ CREATE TABLE IF NOT EXISTS libraries (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Additional locations per library (a category can have many folders)
+CREATE TABLE IF NOT EXISTS library_locations (
+    id SERIAL PRIMARY KEY,
+    library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    path VARCHAR(500) NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(library_id, path)
+);
+
 -- Series
 CREATE TABLE IF NOT EXISTS series (
     id SERIAL PRIMARY KEY,
@@ -94,21 +104,26 @@ CREATE TABLE IF NOT EXISTS favorites (
 
 -- Create indexes
 CREATE INDEX IF NOT EXISTS idx_videos_library ON videos(library_id);
+CREATE INDEX IF NOT EXISTS idx_library_locations_library ON library_locations(library_id);
 CREATE INDEX IF NOT EXISTS idx_videos_series ON videos(series_id);
 CREATE INDEX IF NOT EXISTS idx_videos_season ON videos(season_id);
 CREATE INDEX IF NOT EXISTS idx_videos_type ON videos(video_type);
 CREATE INDEX IF NOT EXISTS idx_series_library ON series(library_id);
 CREATE INDEX IF NOT EXISTS idx_watch_progress_user ON watch_progress(user_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
+-- Un usuario no puede tener dos veces el mismo favorito (índices parciales
+-- porque cada fila usa video_id o series_id, nunca ambos).
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_favorites_user_video
+    ON favorites (user_id, video_id) WHERE video_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_favorites_user_series
+    ON favorites (user_id, series_id) WHERE series_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_favorites_video ON favorites(video_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_series ON favorites(series_id);
 CREATE INDEX IF NOT EXISTS idx_videos_title ON videos(title);
 
--- Insert default admin user (password: admin123)
--- Hash generated with bcryptjs: bcrypt.hashSync('admin123', 10)
-INSERT INTO users (username, email, password_hash, is_admin)
-VALUES ('admin', 'admin@ubeflix.local', '$2a$10$zFo7nqXhpAlrPLCozP/o0OB/rY7BGNmvkxJHPXOWdB.LK0X61k/Rm', TRUE)
-ON CONFLICT (username) DO NOTHING;
+-- El usuario administrador NO se crea aquí a propósito: un hash en el repo es
+-- una contraseña pública. Lo crea el backend al arrancar (services/bootstrapAdmin.js)
+-- usando ADMIN_PASSWORD, o generando una aleatoria que imprime una sola vez.
 
 -- Subtitles table
 CREATE TABLE IF NOT EXISTS subtitles (
@@ -151,3 +166,64 @@ DO $$ BEGIN
     ALTER TABLE videos ADD COLUMN IF NOT EXISTS needs_transcoding BOOLEAN;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
+
+-- ─── Spotify / Music tables ─────────────────────────────
+CREATE TABLE IF NOT EXISTS spotify_playlists (
+    id SERIAL PRIMARY KEY,
+    spotify_id VARCHAR(100) UNIQUE NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    image_url VARCHAR(500),
+    owner VARCHAR(100),
+    track_count INTEGER DEFAULT 0,
+    synced_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS spotify_tracks (
+    id SERIAL PRIMARY KEY,
+    spotify_id VARCHAR(100) UNIQUE NOT NULL,
+    playlist_id INTEGER REFERENCES spotify_playlists(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    artist VARCHAR(255) NOT NULL,
+    album VARCHAR(255),
+    duration_ms INTEGER,
+    cover_url VARCHAR(500),
+    preview_url VARCHAR(500),
+    file_path VARCHAR(500),
+    download_status VARCHAR(20) DEFAULT 'pending', -- 'pending', 'downloading', 'ready', 'failed'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_spotify_tracks_playlist ON spotify_tracks(playlist_id);
+CREATE INDEX IF NOT EXISTS idx_spotify_tracks_status ON spotify_tracks(download_status);
+
+-- ─── Torrent downloads ──────────────────────────────────
+CREATE TABLE IF NOT EXISTS torrent_downloads (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(500) NOT NULL,
+    magnet TEXT NOT NULL,
+    info_hash VARCHAR(64),
+    library_id INTEGER REFERENCES libraries(id) ON DELETE SET NULL,
+    save_path VARCHAR(500) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'queued', -- queued, downloading, completed, paused, error
+    progress REAL NOT NULL DEFAULT 0,             -- 0..1
+    download_speed BIGINT NOT NULL DEFAULT 0,     -- bytes/s
+    upload_speed BIGINT NOT NULL DEFAULT 0,
+    downloaded BIGINT NOT NULL DEFAULT 0,
+    total_size BIGINT NOT NULL DEFAULT 0,
+    num_peers INTEGER NOT NULL DEFAULT 0,
+    eta INTEGER,                                  -- seconds remaining
+    error TEXT,
+    poster_url VARCHAR(500),
+    quality VARCHAR(20),
+    year INTEGER,
+    source VARCHAR(20),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_torrent_downloads_status ON torrent_downloads(status);

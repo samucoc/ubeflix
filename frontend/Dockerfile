@@ -9,6 +9,7 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
+RUN mkdir -p public && cp node_modules/pdfjs-dist/build/pdf.worker.min.mjs public/pdf.worker.min.mjs
 RUN npm run build
 
 # Production stage with nginx

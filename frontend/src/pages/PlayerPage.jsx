@@ -1,15 +1,17 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
-  getVideo, saveProgress, getProgress, getSubtitles,
+  getVideo, saveProgress, getProgress, getNextVideo, getSubtitles,
   extractSubtitles, getSubtitleFileUrl, deleteSubtitle,
-  searchOpenSubtitles, downloadOpenSub, uploadSubtitle
+  searchOpenSubtitles, downloadOpenSub, uploadSubtitle,
+  getAudioTracks
 } from '../api';
 import { useAuth } from '../context/AuthContext';
 import {
   ArrowLeft, Loader, Subtitles, Volume2, VolumeX,
   Maximize, Minimize, Play, Pause, SkipBack, SkipForward,
-  Trash2, Download, Search, Globe, Check, Upload
+  Trash2, Download, Search, Globe, Check, Upload, RotateCcw,
+  ChevronRight, Languages, Settings
 } from 'lucide-react';
 import Hls from 'hls.js';
 
@@ -55,7 +57,22 @@ export default function PlayerPage() {
   const [searching, setSearching] = useState(false);
   const [downloading, setDownloading] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [nextVideo, setNextVideo] = useState(null);
+  const [showNextOverlay, setShowNextOverlay] = useState(false);
+  const nextCountdown = useRef(null);
+  const [nextCountdownSec, setNextCountdownSec] = useState(0);
   const fileInputRef = useRef(null);
+
+  const [audioTracks, setAudioTracks] = useState([]);
+  const [activeAudioTrack, setActiveAudioTrack] = useState(0);
+  const [showAudioMenu, setShowAudioMenu] = useState(false);
+
+  const [qualityLevels, setQualityLevels] = useState([]);
+  const [qualityLevel, setQualityLevel] = useState(-1); // -1 = Auto ABR
+  const [currentQuality, setCurrentQuality] = useState('Auto');
+  const [showQualityMenu, setShowQualityMenu] = useState(false);
+
+  const SUBTITLE_LINE_PERCENT = 85; // 100 = bottom, 85 = ~15% higher
 
   const formatTime = (s) => {
     if (!s || isNaN(s)) return '0:00';
@@ -70,9 +87,23 @@ export default function PlayerPage() {
     setShowControls(true);
     if (hideTimer.current) clearTimeout(hideTimer.current);
     hideTimer.current = setTimeout(() => {
-      if (playing && !showSubMenu && !showSubManager) setShowControls(false);
+      if (playing && !showSubMenu && !showSubManager && !showAudioMenu && !showQualityMenu) setShowControls(false);
     }, 3000);
-  }, [playing, showSubMenu, showSubManager]);
+  }, [playing, showSubMenu, showSubManager, showAudioMenu, showQualityMenu]);
+
+  const applySubtitleOffset = useCallback((textTrack) => {
+    if (!textTrack?.cues || textTrack.cues.length === 0) return;
+    for (let i = 0; i < textTrack.cues.length; i++) {
+      const cue = textTrack.cues[i];
+      if (!cue || !("line" in cue)) continue;
+      try {
+        if ('snapToLines' in cue) cue.snapToLines = false;
+        cue.line = SUBTITLE_LINE_PERCENT;
+      } catch (_) {
+        // Ignore cues that do not allow runtime positioning changes.
+      }
+    }
+  }, [SUBTITLE_LINE_PERCENT]);
 
   // Fetch video + progress
   useEffect(() => {
@@ -83,6 +114,15 @@ export default function PlayerPage() {
       })
       .catch(console.error)
       .finally(() => setLoading(false));
+
+    // Fetch next video info
+    getNextVideo(id).then(res => setNextVideo(res.data?.next || null)).catch(() => setNextVideo(null));
+
+    // Fetch audio tracks
+    getAudioTracks(id).then(res => {
+      const tracks = res.data || [];
+      setAudioTracks(tracks);
+    }).catch(() => setAudioTracks([]));
 
     setSubsExtracting(true);
     getSubtitles(id)
@@ -111,6 +151,7 @@ export default function PlayerPage() {
     return () => {
       if (progressInterval.current) clearInterval(progressInterval.current);
       if (hideTimer.current) clearTimeout(hideTimer.current);
+      if (nextCountdown.current) clearInterval(nextCountdown.current);
       if (videoRef.current && videoRef.current.duration) {
         saveProgress(id, {
           progress_seconds: Math.floor(videoRef.current.currentTime),
@@ -132,6 +173,7 @@ export default function PlayerPage() {
       track.label = sub.label;
       track.srclang = sub.language || 'es';
       track.src = getSubtitleFileUrl(id, sub.id);
+      track.addEventListener('load', () => applySubtitleOffset(track.track));
       if (sub.is_default) track.default = true;
       v.appendChild(track);
     });
@@ -145,36 +187,61 @@ export default function PlayerPage() {
             v.textTracks[i].mode = 'hidden';
           }
         }
+        for (let i = 0; i < v.textTracks.length; i++) applySubtitleOffset(v.textTracks[i]);
       }
     }, 200);
-  }, [subs, subsLoaded, id]);
+  }, [subs, subsLoaded, id, applySubtitleOffset]);
 
-  // Video events
+  // Video events + polling for reliable UI updates
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
     const onPlay = () => setPlaying(true);
     const onPause = () => setPlaying(false);
-    const onTime = () => { if (!seeking) setCurrentTime(v.currentTime); };
-    const onDur = () => setDuration(v.duration);
-    const onBuf = () => { if (v.buffered.length > 0) setBuffered(v.buffered.end(v.buffered.length - 1)); };
+    const onEnd = () => {
+      setPlaying(false);
+      // Show next video overlay with countdown
+      if (nextVideoRef.current) {
+        setShowNextOverlay(true);
+        setNextCountdownSec(10);
+        let sec = 10;
+        if (nextCountdown.current) clearInterval(nextCountdown.current);
+        nextCountdown.current = setInterval(() => {
+          sec--;
+          setNextCountdownSec(sec);
+          if (sec <= 0) {
+            clearInterval(nextCountdown.current);
+            goToNextVideo();
+          }
+        }, 1000);
+      }
+    };
     const onVol = () => { setVolume(v.volume); setMuted(v.muted); };
-    const onEnd = () => setPlaying(false);
     v.addEventListener('play', onPlay);
     v.addEventListener('pause', onPause);
-    v.addEventListener('timeupdate', onTime);
-    v.addEventListener('durationchange', onDur);
-    v.addEventListener('progress', onBuf);
     v.addEventListener('volumechange', onVol);
     v.addEventListener('ended', onEnd);
+
+    // Poll currentTime, duration and buffered every 250ms
+    const interval = setInterval(() => {
+      if (!v) return;
+      if (v.duration && !isNaN(v.duration) && v.duration !== Infinity) {
+        setDuration(v.duration);
+      }
+      if (!seeking) {
+        setCurrentTime(v.currentTime);
+      }
+      if (v.buffered && v.buffered.length > 0) {
+        setBuffered(v.buffered.end(v.buffered.length - 1));
+      }
+    }, 250);
+
     return () => {
       v.removeEventListener('play', onPlay);
       v.removeEventListener('pause', onPause);
-      v.removeEventListener('timeupdate', onTime);
-      v.removeEventListener('durationchange', onDur);
-      v.removeEventListener('progress', onBuf);
       v.removeEventListener('volumechange', onVol);
       v.removeEventListener('ended', onEnd);
+      clearInterval(interval);
     };
   }, [seeking]);
 
@@ -183,18 +250,30 @@ export default function PlayerPage() {
     if (!video || !videoRef.current) return;
     const token = localStorage.getItem('ubeflix_token');
     const el = videoRef.current;
-    const restore = () => { if (savedTime.current > 0) el.currentTime = savedTime.current; };
+    // Save current time before switching audio track
+    const currentPos = el.currentTime || 0;
+    const restore = () => {
+      const t = currentPos > 0 ? currentPos : savedTime.current;
+      if (t > 0) el.currentTime = t;
+    };
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
 
     if (video.needs_transcoding) {
       setTranscoding(true); setVideoError(false);
-      const hlsUrl = `/api/videos/${id}/hls/index.m3u8?token=${encodeURIComponent(token)}`;
+      // Reset quality state for the new video/audio track
+      setQualityLevels([]);
+      setQualityLevel(-1);
+      setCurrentQuality('Auto');
+      const hlsUrl = `/api/videos/${id}/hls/index.m3u8?token=${encodeURIComponent(token)}&audioTrack=${activeAudioTrack}`;
       if (Hls.isSupported()) {
         const hls = new Hls({
           xhrSetup: (xhr, url) => {
-            if (!url.includes('token=')) {
+            if (!url.includes('token=') || !url.includes('audioTrack=')) {
               const sep = url.includes('?') ? '&' : '?';
-              xhr.open('GET', `${url}${sep}token=${encodeURIComponent(token)}`, true);
+              const params = [];
+              if (!url.includes('token=')) params.push(`token=${encodeURIComponent(token)}`);
+              if (!url.includes('audioTrack=')) params.push(`audioTrack=${encodeURIComponent(activeAudioTrack)}`);
+              xhr.open('GET', `${url}${sep}${params.join('&')}`, true);
             }
           },
           maxBufferLength: 30, maxMaxBufferLength: 60,
@@ -206,8 +285,28 @@ export default function PlayerPage() {
         });
         hls.loadSource(hlsUrl);
         hls.attachMedia(el);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => { setTranscoding(false); restore(); el.play().catch(() => {}); });
+        hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+          setTranscoding(false);
+          restore();
+          el.play().catch(() => {});
+          // Populate quality level list from the master playlist levels
+          if (hls.levels && hls.levels.length > 1) {
+            setQualityLevels(hls.levels.map((l, idx) => ({
+              index: idx,
+              height: l.height,
+              bitrate: l.bitrate,
+              label: l.height ? `${l.height}p` : `Nivel ${idx + 1}`,
+            })));
+          }
+        });
         hls.on(Hls.Events.BUFFER_APPENDED, () => setTranscoding(false));
+        hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
+          const level = hls.levels[data.level];
+          setCurrentQuality(level?.height ? `${level.height}p` : 'Auto');
+          if (level?.height) {
+            console.log(`[HLS] quality switched to ${level.height}p (${Math.round((level.bitrate || 0) / 1000)} kbps)`);
+          }
+        });
         hls.on(Hls.Events.ERROR, (_, data) => {
           if (data.fatal) {
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
@@ -223,12 +322,15 @@ export default function PlayerPage() {
         setVideoError(true); setTranscoding(false); setErrorMessage('Navegador no soportado');
       }
     } else {
+      setQualityLevels([]);
+      setQualityLevel(-1);
+      setCurrentQuality('Direct');
       el.src = `/api/videos/${id}/stream?token=${encodeURIComponent(token)}`;
       el.addEventListener('loadedmetadata', restore, { once: true });
       el.addEventListener('canplay', () => { setVideoError(false); setTranscoding(false); }, { once: true });
       el.addEventListener('error', () => { setVideoError(true); setErrorMessage('No se pudo reproducir'); }, { once: true });
     }
-  }, [video, id]);
+  }, [video, id, activeAudioTrack]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -244,7 +346,8 @@ export default function PlayerPage() {
         case 'ArrowDown': e.preventDefault(); v.volume = Math.max(0, v.volume - 0.1); break;
         case 'f': e.preventDefault(); toggleFullscreen(); break;
         case 'm': e.preventDefault(); v.muted = !v.muted; break;
-        case 'Escape': setShowSubMenu(false); setShowSubManager(false); break;
+        case 'n': e.preventDefault(); if (nextVideoRef.current) goToNextVideo(); break;
+        case 'Escape': setShowSubMenu(false); setShowSubManager(false); setShowAudioMenu(false); setShowQualityMenu(false); break;
         default: break;
       }
       resetHideTimer();
@@ -275,13 +378,29 @@ export default function PlayerPage() {
   const handleSeekStart = (e) => { setSeeking(true); seek(e); };
   const handleSeekMove = (e) => { if (seeking) seek(e); };
   const handleSeekEnd = (e) => { if (seeking) { seek(e); setSeeking(false); } };
-  const skipBack = () => { if (videoRef.current) videoRef.current.currentTime -= 10; resetHideTimer(); };
-  const skipForward = () => { if (videoRef.current) videoRef.current.currentTime += 10; resetHideTimer(); };
+  const skipBack = () => { if (videoRef.current) videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 10); resetHideTimer(); };
+  const skipForward = () => { if (videoRef.current) videoRef.current.currentTime = Math.min(videoRef.current.duration || 0, videoRef.current.currentTime + 10); resetHideTimer(); };
+  const restartVideo = () => { if (videoRef.current) { videoRef.current.currentTime = 0; videoRef.current.play().catch(() => {}); } resetHideTimer(); };
   const handleVolumeChange = (e) => { if (videoRef.current) { videoRef.current.volume = parseFloat(e.target.value); videoRef.current.muted = false; } };
+
+  // Ref to keep nextVideo accessible in event handlers
+  const nextVideoRef = useRef(null);
+  useEffect(() => { nextVideoRef.current = nextVideo; }, [nextVideo]);
+
+  const goToNextVideo = () => {
+    if (nextCountdown.current) clearInterval(nextCountdown.current);
+    setShowNextOverlay(false);
+    if (nextVideoRef.current) navigate(`/player/${nextVideoRef.current.id}`, { replace: true });
+  };
+  const cancelNextCountdown = () => {
+    if (nextCountdown.current) clearInterval(nextCountdown.current);
+    setShowNextOverlay(false);
+  };
 
   const selectSubTrack = (index) => {
     const v = videoRef.current;
     if (!v?.textTracks) return;
+    applySubtitleOffset(v.textTracks[index]);
     for (let i = 0; i < v.textTracks.length; i++) v.textTracks[i].mode = i === index ? 'showing' : 'hidden';
     setActiveSubTrack(index);
     setShowSubMenu(false);
@@ -292,6 +411,26 @@ export default function PlayerPage() {
     for (let i = 0; i < v.textTracks.length; i++) v.textTracks[i].mode = 'hidden';
     setActiveSubTrack(-1);
     setShowSubMenu(false);
+  };
+
+  const selectAudioTrack = (trackIndex) => {
+    if (trackIndex === activeAudioTrack) { setShowAudioMenu(false); return; }
+    const v = videoRef.current;
+    // Save current position before switching
+    if (v && v.currentTime) savedTime.current = v.currentTime;
+    if (video?.needs_transcoding) {
+      // For HLS: changing activeAudioTrack triggers useEffect to restart HLS with new audio
+      setActiveAudioTrack(trackIndex);
+    } else {
+      // For direct play: try native audioTracks API
+      if (v && v.audioTracks && v.audioTracks.length > 1) {
+        for (let i = 0; i < v.audioTracks.length; i++) {
+          v.audioTracks[i].enabled = (i === trackIndex);
+        }
+        setActiveAudioTrack(trackIndex);
+      }
+    }
+    setShowAudioMenu(false);
   };
 
   const handleDeleteSub = async (subId) => {
@@ -357,7 +496,7 @@ export default function PlayerPage() {
       ref={containerRef}
       onMouseMove={resetHideTimer}
       onClick={(e) => {
-        if (e.target.closest('.nfx-controls') || e.target.closest('.nfx-sub-menu') || e.target.closest('.nfx-sub-manager')) return;
+        if (e.target.closest('.nfx-controls') || e.target.closest('.nfx-sub-menu') || e.target.closest('.nfx-sub-manager') || e.target.closest('.nfx-audio-menu')) return;
         togglePlay();
       }}
     >
@@ -382,6 +521,28 @@ export default function PlayerPage() {
         </div>
       )}
 
+      {video?.needs_transcoding && !videoError && !transcoding && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 18,
+            right: 18,
+            zIndex: 25,
+            background: 'rgba(0,0,0,0.55)',
+            border: '1px solid rgba(255,255,255,0.18)',
+            borderRadius: 8,
+            padding: '8px 10px',
+            color: '#fff',
+            fontSize: 12,
+            lineHeight: 1.3,
+            backdropFilter: 'blur(3px)',
+          }}
+        >
+          <div><strong>Calidad:</strong> {qualityLevel === -1 ? `${currentQuality} (Auto)` : `${currentQuality} (Manual)`}</div>
+          {qualityLevels.length > 1 && <div><strong>Niveles:</strong> {qualityLevels.map((q) => q.label).join(' / ')}</div>}
+        </div>
+      )}
+
       {/* Top bar */}
       <div className={`nfx-top ${showControls ? 'visible' : ''}`}>
         <button className="nfx-back" onClick={(e) => { e.stopPropagation(); navigate(-1); }}>
@@ -390,10 +551,20 @@ export default function PlayerPage() {
         <div className="nfx-title">{buildTitle()}</div>
       </div>
 
-      {/* Center play icon */}
-      {!playing && !transcoding && !videoError && duration > 0 && (
-        <div className="nfx-center-play" onClick={(e) => { e.stopPropagation(); togglePlay(); }}>
-          <Play size={56} fill="white" />
+      {/* Center playback controls */}
+      {!transcoding && !videoError && duration > 0 && (
+        <div className={`nfx-center-controls ${showControls || !playing ? 'visible' : ''}`} onClick={(e) => e.stopPropagation()}>
+          <button className="nfx-center-btn" onClick={skipBack} title="-10s">
+            <SkipBack size={32} />
+            <span className="nfx-center-btn-label">10</span>
+          </button>
+          <button className="nfx-center-btn nfx-center-btn-play" onClick={togglePlay}>
+            {playing ? <Pause size={40} /> : <Play size={40} fill="white" />}
+          </button>
+          <button className="nfx-center-btn" onClick={skipForward} title="+10s">
+            <SkipForward size={32} />
+            <span className="nfx-center-btn-label">10</span>
+          </button>
         </div>
       )}
 
@@ -414,23 +585,99 @@ export default function PlayerPage() {
             <button className="nfx-btn" onClick={togglePlay}>
               {playing ? <Pause size={22} /> : <Play size={22} fill="white" />}
             </button>
+            <button className="nfx-btn" onClick={restartVideo} title="Volver al inicio"><RotateCcw size={20} /></button>
             <button className="nfx-btn" onClick={skipBack} title="-10s"><SkipBack size={20} /></button>
             <button className="nfx-btn" onClick={skipForward} title="+10s"><SkipForward size={20} /></button>
+            {nextVideo && (
+              <button className="nfx-btn" onClick={goToNextVideo} title="Siguiente">
+                <ChevronRight size={22} />
+              </button>
+            )}
             <div className="nfx-volume-group">
               <button className="nfx-btn" onClick={toggleMute}>
                 {muted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
               </button>
               <input type="range" min="0" max="1" step="0.05"
                 value={muted ? 0 : volume} onChange={handleVolumeChange}
-                className="nfx-volume-slider" />
+                className="nfx-volume-slider"
+                style={{ background: `linear-gradient(to right, #e50914 ${(muted ? 0 : volume) * 100}%, rgba(255,255,255,0.3) ${(muted ? 0 : volume) * 100}%)` }} />
             </div>
             <span className="nfx-time">{formatTime(currentTime)} / {formatTime(duration)}</span>
           </div>
 
           <div className="nfx-controls-right">
+            {/* Audio tracks button */}
+            {audioTracks.length > 1 && (
+              <div style={{ position: 'relative' }}>
+                <button className="nfx-btn active"
+                  onClick={() => { setShowAudioMenu(!showAudioMenu); setShowSubMenu(false); setShowSubManager(false); setShowQualityMenu(false); }} title="Audio">
+                  <Languages size={20} />
+                </button>
+                {showAudioMenu && (
+                  <div className="nfx-sub-menu nfx-audio-menu" onClick={e => e.stopPropagation()}>
+                    <div className="nfx-sub-menu-title">Audio</div>
+                    {audioTracks.map((track, i) => (
+                      <button key={i} className={`nfx-sub-option ${activeAudioTrack === i ? 'active' : ''}`}
+                        onClick={() => selectAudioTrack(i)}>
+                        {activeAudioTrack === i && <Check size={14} />}
+                        <span>{track.label}</span>
+                        {track.channels && (
+                          <span className="nfx-sub-source">
+                            {track.channels >= 6 ? '5.1' : track.channels >= 8 ? '7.1' : `${track.channels}ch`}
+                          </span>
+                        )}
+                        {track.codec && (
+                          <span className="nfx-sub-source">{track.codec.toUpperCase()}</span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {/* Quality selector (only for HLS with multiple renditions) */}
+            {qualityLevels.length > 1 && (
+              <div style={{ position: 'relative' }}>
+                <button
+                  className="nfx-btn active"
+                  onClick={() => { setShowQualityMenu(!showQualityMenu); setShowSubMenu(false); setShowAudioMenu(false); setShowSubManager(false); }}
+                  title="Calidad"
+                  style={{ minWidth: 44 }}
+                >
+                  <Settings size={18} />
+                  <span style={{ fontSize: 10, marginLeft: 2, fontWeight: 700 }}>
+                    {qualityLevel === -1 ? 'AUTO' : currentQuality}
+                  </span>
+                </button>
+                {showQualityMenu && (
+                  <div className="nfx-sub-menu" onClick={e => e.stopPropagation()}>
+                    <div className="nfx-sub-menu-title">Calidad</div>
+                    <button
+                      className={`nfx-sub-option ${qualityLevel === -1 ? 'active' : ''}`}
+                      onClick={() => { if (hlsRef.current) hlsRef.current.currentLevel = -1; setQualityLevel(-1); setShowQualityMenu(false); }}
+                    >
+                      {qualityLevel === -1 && <Check size={14} />}
+                      <span>Auto</span>
+                      {qualityLevel === -1 && <span className="nfx-sub-source">{currentQuality}</span>}
+                    </button>
+                    {qualityLevels.map((ql) => (
+                      <button
+                        key={ql.index}
+                        className={`nfx-sub-option ${qualityLevel === ql.index ? 'active' : ''}`}
+                        onClick={() => { if (hlsRef.current) hlsRef.current.currentLevel = ql.index; setQualityLevel(ql.index); setShowQualityMenu(false); }}
+                      >
+                        {qualityLevel === ql.index && <Check size={14} />}
+                        <span>{ql.label}</span>
+                        {ql.bitrate && <span className="nfx-sub-source">{Math.round(ql.bitrate / 1000)}k</span>}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             <div style={{ position: 'relative' }}>
               <button className={`nfx-btn ${subs.length > 0 ? 'active' : ''}`}
-                onClick={() => { setShowSubMenu(!showSubMenu); setShowSubManager(false); }} title="Subtítulos">
+                onClick={() => { setShowSubMenu(!showSubMenu); setShowSubManager(false); setShowAudioMenu(false); setShowQualityMenu(false); }} title="Subtítulos">
                 <Subtitles size={20} />
               </button>
               {showSubMenu && (
@@ -522,6 +769,29 @@ export default function PlayerPage() {
                 </button>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* Next video overlay */}
+      {showNextOverlay && nextVideo && (
+        <div className="nfx-next-overlay" onClick={e => e.stopPropagation()}>
+          <div className="nfx-next-content">
+            <p className="nfx-next-label">Siguiente en {nextCountdownSec}s</p>
+            <p className="nfx-next-title">
+              {nextVideo.series_title && `${nextVideo.series_title} — `}
+              {nextVideo.season_number != null && `S${String(nextVideo.season_number).padStart(2, '0')}`}
+              {nextVideo.episode_number != null && `E${String(nextVideo.episode_number).padStart(2, '0')} `}
+              {nextVideo.title}
+            </p>
+            <div className="nfx-next-buttons">
+              <button className="btn btn-primary" onClick={goToNextVideo}>
+                <Play size={16} fill="white" /> Reproducir ahora
+              </button>
+              <button className="btn btn-secondary" onClick={cancelNextCountdown}>
+                Cancelar
+              </button>
+            </div>
           </div>
         </div>
       )}

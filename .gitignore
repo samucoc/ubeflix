@@ -1,8 +1,10 @@
 node_modules/
 dist/
 build/
-.env
-.env.local
+# Secretos: ignorar todo .env* salvo la plantilla de ejemplo
+.env*
+!.env.example
+.db-password-nueva.txt
 *.log
 postgres_data/
 videos/

@@ -16,14 +16,35 @@ const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
 // Or:       /SeriesName/S01E01 - Episode Title.mkv
 // Or:       /SeriesName/Season 1/S01E01.mkv
 // Or:       /SeriesName/SubFolder/Episode01.mkv  (subfolder as season)
+function extractSeriesTitleFromFilename(filename) {
+  const patterns = [
+    /(.*?)[\s._-]*[Ss](\d+)[Ee](\d+)(.*)/,
+    /(.*?)[\s._-]*(\d+)x(\d+)(.*)/i,
+    /(.*?)[\s._-]*(?:episode|episodio|ep|e)\s*(\d+)(.*)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = filename.match(pattern);
+    if (match) {
+      const title = cleanTitle(match[1]);
+      if (title) return title;
+    }
+  }
+
+  return '';
+}
+
 function parseSeriesInfo(filePath, libraryPath) {
   const relative = path.relative(libraryPath, filePath);
   const parts = relative.split(path.sep);
+  const filename = path.basename(filePath, path.extname(filePath));
+  const hasSeriesFolder = parts.length >= 2;
+  const seriesFolder = hasSeriesFolder ? parts[0] : null;
+  const seriesTitle = hasSeriesFolder
+    ? cleanTitle(seriesFolder)
+    : extractSeriesTitleFromFilename(filename);
 
-  if (parts.length < 2) return null;
-
-  const seriesFolder = parts[0];
-  const seriesTitle = cleanTitle(seriesFolder);
+  if (!seriesTitle) return null;
 
   let seasonNumber = 1;
   let episodeNumber = null;
@@ -35,7 +56,8 @@ function parseSeriesInfo(filePath, libraryPath) {
   if (parts.length >= 3) {
     seasonFolder = parts[1];
     subfolderName = parts[1];
-    const seasonMatch = seasonFolder.match(/(?:season|temporada|s)\s*(\d+)/i);
+    // Match "Season 2", "Temporada 3", or strict "S01" prefix (at word boundary, digits immediately after)
+    const seasonMatch = seasonFolder.match(/\b(?:season|temporada)\s*(\d+)/i) || seasonFolder.match(/\bs(\d+)/i);
     if (seasonMatch) {
       seasonNumber = parseInt(seasonMatch[1]);
     } else {
@@ -46,8 +68,6 @@ function parseSeriesInfo(filePath, libraryPath) {
   }
 
   // Parse episode info from filename
-  const filename = path.basename(filePath, path.extname(filePath));
-
   // Try S01E01 format
   const seMatch = filename.match(/[Ss](\d+)[Ee](\d+)/);
   if (seMatch) {
@@ -172,7 +192,7 @@ function findVideoFiles(dirPath) {
         const fullPath = path.join(currentPath, entry.name);
         if (entry.isDirectory()) {
           // Skip hidden folders, extras, etc.
-          if (entry.name.startsWith('.') || ['extras', 'featurettes', 'behind the scenes', 'trailers', 'subs', 'subtitles'].includes(entry.name.toLowerCase())) {
+          if (entry.name.startsWith('.') || ['extras', 'featurettes', 'behind the scenes', 'trailers', 'subs', 'subtitles', 'torrents'].includes(entry.name.toLowerCase())) {
             continue;
           }
           walk(fullPath);
@@ -205,17 +225,33 @@ function getFileSize(filePath) {
 
 // Main scan function
 async function scanLibrary(library) {
-  console.log(`📁 Scanning library: ${library.name} (${library.library_type}) at ${library.path}`);
+  const locations = Array.isArray(library.locations) && library.locations.length > 0
+    ? [...new Set(library.locations.map((p) => String(p).trim()).filter(Boolean))]
+    : (library.path ? [library.path] : []);
 
-  const libraryPath = library.path;
+  console.log(`📁 Scanning library: ${library.name} (${library.library_type}) on ${locations.length} location(s)`);
 
-  if (!fs.existsSync(libraryPath)) {
-    console.error(`Library path does not exist: ${libraryPath}`);
-    return { error: 'Path does not exist', scanned: 0 };
+  if (locations.length === 0) {
+    console.error('Library has no configured locations');
+    return { error: 'No locations configured', scanned: 0 };
   }
 
-  const videoFiles = findVideoFiles(libraryPath);
-  console.log(`Found ${videoFiles.length} video files on disk`);
+  const scannedFiles = [];
+  for (const location of locations) {
+    if (!fs.existsSync(location)) {
+      console.warn(`Library location does not exist, skipping: ${location}`);
+      continue;
+    }
+
+    const files = findVideoFiles(location);
+    console.log(`  • ${location}: ${files.length} video(s)`);
+    for (const filePath of files) {
+      scannedFiles.push({ filePath, rootPath: location });
+    }
+  }
+
+  const videoFiles = scannedFiles.map((entry) => entry.filePath);
+  console.log(`Found ${videoFiles.length} video files on disk in total`);
 
   // Build a set of current file paths on disk for fast lookup
   const diskPaths = new Set(videoFiles);
@@ -227,7 +263,7 @@ async function scanLibrary(library) {
   let errors = 0;
 
   if (library.library_type === 'series') {
-    const result = await scanSeriesLibrary(library, videoFiles, libraryPath, diskPaths);
+    const result = await scanSeriesLibrary(library, scannedFiles, diskPaths);
     added = result.added;
     removed = result.removed;
     updated = result.updated;
@@ -286,7 +322,7 @@ async function scanLibrary(library) {
   return { added, updated, removed, skipped, errors };
 }
 
-async function scanSeriesLibrary(library, videoFiles, libraryPath, diskPaths) {
+async function scanSeriesLibrary(library, scannedFiles, diskPaths) {
   let added = 0;
   let removed = 0;
   let updated = 0;
@@ -336,26 +372,32 @@ async function scanSeriesLibrary(library, videoFiles, libraryPath, diskPaths) {
   // Group files by series
   const seriesMap = new Map();
 
-  for (const filePath of videoFiles) {
-    const info = parseSeriesInfo(filePath, libraryPath);
+  for (const scannedFile of scannedFiles) {
+    const { filePath, rootPath } = scannedFile;
+    const info = parseSeriesInfo(filePath, rootPath);
     if (!info) continue;
 
-    if (!seriesMap.has(info.seriesTitle)) {
-      seriesMap.set(info.seriesTitle, {
+    const seriesKey = `${info.seriesTitle}@@${rootPath}`;
+
+    if (!seriesMap.has(seriesKey)) {
+      seriesMap.set(seriesKey, {
         ...info,
+        rootPath,
         episodes: [],
       });
     }
 
-    seriesMap.get(info.seriesTitle).episodes.push({
+    seriesMap.get(seriesKey).episodes.push({
       ...info,
+      rootPath,
       filePath,
       fileSize: getFileSize(filePath),
     });
   }
 
-  for (const [seriesTitle, seriesData] of seriesMap) {
+  for (const [seriesKey, seriesData] of seriesMap) {
     try {
+      const seriesTitle = seriesData.seriesTitle;
       // Find or create series
       let seriesResult = await pool.query(
         'SELECT id FROM series WHERE title = $1 AND library_id = $2',
@@ -363,7 +405,9 @@ async function scanSeriesLibrary(library, videoFiles, libraryPath, diskPaths) {
       );
 
       let seriesId;
-      const seriesFolder = path.join(libraryPath, seriesData.seriesFolder);
+      const seriesFolder = seriesData.seriesFolder
+        ? path.join(seriesData.rootPath, seriesData.seriesFolder)
+        : seriesData.rootPath;
       const seriesImages = findImages(seriesFolder);
 
       if (seriesResult.rows.length === 0) {
@@ -375,20 +419,18 @@ async function scanSeriesLibrary(library, videoFiles, libraryPath, diskPaths) {
         console.log(`  📺 Created series: ${seriesTitle}`);
       } else {
         seriesId = seriesResult.rows[0].id;
-        // Update series images if found new ones
-        if (seriesImages.poster || seriesImages.banner) {
-          await pool.query(
-            'UPDATE series SET poster_path = COALESCE($1, poster_path), banner_path = COALESCE($2, banner_path) WHERE id = $3',
-            [seriesImages.poster, seriesImages.banner, seriesId]
-          );
-        }
+        // Always update series images and folder_path on rescan
+        await pool.query(
+          'UPDATE series SET poster_path = COALESCE($1, poster_path), banner_path = COALESCE($2, banner_path), folder_path = $3 WHERE id = $4',
+          [seriesImages.poster, seriesImages.banner, seriesFolder, seriesId]
+        );
       }
 
       // Group episodes by season (use subfolder name as key when present)
       const seasonMap = new Map();
       for (const ep of seriesData.episodes) {
         // Use subfolderName as grouping key if it exists and is NOT a standard season folder
-        const isStandardSeason = ep.seasonFolder && /(?:season|temporada|s)\s*\d+/i.test(ep.seasonFolder);
+        const isStandardSeason = ep.seasonFolder && (/\b(?:season|temporada)\s*\d+/i.test(ep.seasonFolder) || /\bs\d+/i.test(ep.seasonFolder));
         const seasonKey = ep.subfolderName && !isStandardSeason
           ? `sub_${ep.subfolderName}`
           : String(ep.seasonNumber);
@@ -400,7 +442,11 @@ async function scanSeriesLibrary(library, videoFiles, libraryPath, diskPaths) {
 
       // Auto-number seasons when there are multiple subfolder-based groups
       let autoSeasonNum = 0;
-      const sortedSeasonKeys = [...seasonMap.keys()].sort();
+      const sortedSeasonKeys = [...seasonMap.keys()].sort((a, b) => {
+        const na = parseInt(a), nb = parseInt(b);
+        if (!isNaN(na) && !isNaN(nb)) return na - nb;
+        return a.localeCompare(b);
+      });
 
       for (const seasonKey of sortedSeasonKeys) {
         autoSeasonNum++;
@@ -463,7 +509,7 @@ async function scanSeriesLibrary(library, videoFiles, libraryPath, diskPaths) {
         }
       }
     } catch (err) {
-      console.error(`  ❌ Error processing series ${seriesTitle}:`, err.message);
+      console.error(`  ❌ Error processing series ${seriesKey}:`, err.message);
     }
   }
 

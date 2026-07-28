@@ -14,6 +14,7 @@ const { execSync } = require('child_process');
 const axios = require('axios');
 const unzipper = require('unzipper');
 const { pool } = require('../config/db');
+const { normalizeSubtitleFileInPlace } = require('./subtitleEncoding');
 
 const SUBS_DIR = '/tmp/ubeflix-subs';
 const SUBTITLE_EXTENSIONS = new Set(['.srt', '.vtt', '.ass', '.ssa', '.sub']);
@@ -296,6 +297,10 @@ async function processDownloadedSubtitle(buffer, fileId, videoId, videoSubDir, o
     const fileExt = path.extname(srtFile).toLowerCase();
     let vttPath = srtFile;
     let format = fileExt.substring(1);
+
+    if (fileExt === '.srt' || fileExt === '.vtt') {
+      try { normalizeSubtitleFileInPlace(srtFile, fileExt === '.vtt' ? 'vtt' : 'srt'); } catch {}
+    }
 
     if (['.srt', '.ass', '.ssa'].includes(fileExt)) {
       vttPath = srtFile.replace(/\.[^.]+$/, '.vtt');

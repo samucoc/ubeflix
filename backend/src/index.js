@@ -2,174 +2,182 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
-const path = require('path');
-const fs = require('fs');
 require('dotenv').config();
 
-const { pool } = require('./config/db');
 const { authenticateToken } = require('./middleware/auth');
+const httpLogger = require('./middleware/httpLogger');
+
 const authRoutes = require('./routes/auth');
 const videosRoutes = require('./routes/videos');
 const librariesRoutes = require('./routes/libraries');
 const favoritesRoutes = require('./routes/favorites');
 const usersRoutes = require('./routes/users');
 const subtitlesRoutes = require('./routes/subtitles');
+const musicRoutes = require('./routes/music');
+const comicsRoutes = require('./routes/comics');
+const torrentsRoutes = require('./routes/torrents');
+const imagesRoutes = require('./routes/images');
+const searchRoutes = require('./routes/search');
+const dashboardRoutes = require('./routes/dashboard');
+const livetvRoutes = require('./routes/livetv');
 
+const { runMigrations } = require('./migrations/runner');
 const { startSubtitleCron } = require('./services/subtitleCron');
-const httpLogger = require('./middleware/httpLogger');
+const { resetStuckDownloads, initSpotdlConfig } = require('./services/spotifySync');
+const { resumeOnStartup: resumeTorrents } = require('./services/torrents');
+const { bootstrapAdmin } = require('./services/bootstrapAdmin');
 
 const app = express();
 const PORT = process.env.PORT || 5566;
 
-// Middleware
+// El backend vive detrás de nginx (y opcionalmente de un túnel cloudflare), así
+// que sin esto `req.ip` es siempre la IP de nginx y el rate limit del login se
+// vuelve global: un solo atacante bloquearía el acceso de todos los usuarios.
+// Confiamos únicamente en proxies de red privada (la red Docker / la LAN); un
+// cliente que llegue directo desde internet no puede falsificar X-Forwarded-For.
+app.set('trust proxy', process.env.TRUST_PROXY || 'uniquelocal');
+
+// ─── Process-level safety net ────────────────────────────────────────────
+// The embedded BitTorrent client (WebTorrent) emits stray errors from
+// tracker/DHT/UDP sockets that would otherwise take down the media server, so
+// those are logged and swallowed. Anything else is a real bug: swallowing it
+// leaves the process in an unknown state, so we exit and let Docker's
+// `restart: unless-stopped` bring back a clean one.
+const TOLERATED_ERROR_SOURCES = [
+  /webtorrent/i,
+  /bittorrent/i,
+  /torrent-discovery/i,
+  /\bdht\b/i,
+  /\butp\b/i,
+  /bep\d+/i,
+  /ut_metadata/i,
+  /simple-peer/i,
+];
+
+function isTolerableBackgroundError(err) {
+  const description = (err && err.stack) || String(err);
+  return TOLERATED_ERROR_SOURCES.some((pattern) => pattern.test(description));
+}
+
+process.on('uncaughtException', (err) => {
+  if (isTolerableBackgroundError(err)) {
+    console.error('⚠️  [uncaughtException] error del cliente torrent, se continúa:', err && err.stack ? err.stack : err);
+    return;
+  }
+  console.error('💀 [uncaughtException] error no recuperable, cerrando:', err && err.stack ? err.stack : err);
+  // Give the log a tick to flush before exiting.
+  setTimeout(() => process.exit(1), 100).unref();
+});
+
+// Rejections don't corrupt process state the way an uncaught throw does, and
+// route handlers now funnel theirs to the error middleware via asyncHandler.
+// What reaches here is background work — log it and keep serving.
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️  [unhandledRejection] keeping process alive:', reason && reason.stack ? reason.stack : reason);
+});
+
+// ─── Middleware ──────────────────────────────────────────────────────────
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
   contentSecurityPolicy: false,
 }));
 app.use(compression());
 app.use(cors({
-  origin: ['http://localhost:3344', 'http://localhost:5173'],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    // Allow localhost and any trycloudflare tunnel
+    const allowed = [
+      'http://localhost:3344',
+      'http://localhost:5173',
+    ];
+    let hostname;
+    try {
+      hostname = new URL(origin).hostname;
+    } catch {
+      return callback(new Error('Not allowed by CORS'));
+    }
+    if (allowed.includes(origin) || /\.trycloudflare\.com$/.test(hostname)) {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
   credentials: true,
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(httpLogger);
 
-// Health check
+// ─── Health check ────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', service: 'ubeFlix API', timestamp: new Date().toISOString() });
 });
 
-// Public routes
+// ─── Public routes ───────────────────────────────────────────────────────
 app.use('/api/auth', (req, res, next) => {
   // /login and /register are public, /me requires auth
-  if (req.path === '/me') {
+  if (req.path === '/me' || req.path === '/media-token') {
     return authenticateToken(req, res, next);
   }
   next();
 }, authRoutes);
 
-// Protected routes
+// ─── Protected routes ────────────────────────────────────────────────────
 app.use('/api/videos', authenticateToken, videosRoutes);
 app.use('/api/libraries', authenticateToken, librariesRoutes);
 app.use('/api/favorites', authenticateToken, favoritesRoutes);
 app.use('/api/users', authenticateToken, usersRoutes);
 app.use('/api/subtitles', authenticateToken, subtitlesRoutes);
+app.use('/api/music', authenticateToken, musicRoutes);
+app.use('/api/comics', authenticateToken, comicsRoutes);
+app.use('/api/torrents', authenticateToken, torrentsRoutes);
+app.use('/api/images', authenticateToken, imagesRoutes);
+app.use('/api/search', authenticateToken, searchRoutes);
+app.use('/api/dashboard', authenticateToken, dashboardRoutes);
+app.use('/api/livetv', authenticateToken, livetvRoutes);
 
-// Serve video thumbnails / posters from disk
-app.get('/api/images/*', authenticateToken, (req, res) => {
-  let imagePath = decodeURIComponent(req.params[0]);
-  if (!imagePath || imagePath.includes('..') || imagePath.includes('\0')) {
-    return res.status(400).json({ error: 'Invalid path' });
-  }
-
-  // The image path is stored as absolute in db
-  if (fs.existsSync(imagePath)) {
-    res.setHeader('Cache-Control', 'public, max-age=604800'); // 7 days
-    res.sendFile(imagePath);
-  } else {
-    res.status(404).json({ error: 'Image not found' });
-  }
-});
-
-// Unified search — search across movies and series
-app.get('/api/search', authenticateToken, async (req, res) => {
-  try {
-    const { q } = req.query;
-    if (!q || q.trim().length === 0) {
-      return res.json({ movies: [], series: [] });
-    }
-
-    const searchTerm = `%${q.trim()}%`;
-
-    const [moviesResult, seriesResult] = await Promise.all([
-      pool.query(`
-        SELECT v.id, v.title, v.poster_path, v.thumbnail_path, v.year, v.video_type
-        FROM videos v
-        WHERE v.title ILIKE $1 AND v.video_type = 'movie'
-        ORDER BY v.title ASC
-        LIMIT 20
-      `, [searchTerm]),
-      pool.query(`
-        SELECT s.id, s.title, s.poster_path, s.thumbnail_path, s.year,
-          (SELECT COUNT(*) FROM videos WHERE series_id = s.id) as episode_count
-        FROM series s
-        WHERE s.title ILIKE $1
-        ORDER BY s.title ASC
-        LIMIT 20
-      `, [searchTerm]),
-    ]);
-
-    res.json({
-      movies: moviesResult.rows,
-      series: seriesResult.rows,
-    });
-  } catch (err) {
-    console.error('Search error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-});
-
-// Dashboard stats
-app.get('/api/dashboard', authenticateToken, async (req, res) => {
-  try {
-    const [movies, episodes, series, libraries, recentlyAdded, continueWatching] = await Promise.all([
-      pool.query("SELECT COUNT(*) as count FROM videos WHERE video_type = 'movie'"),
-      pool.query("SELECT COUNT(*) as count FROM videos WHERE video_type = 'episode'"),
-      pool.query('SELECT COUNT(*) as count FROM series'),
-      pool.query('SELECT COUNT(*) as count FROM libraries'),
-      pool.query(`
-        SELECT v.id, v.title, v.video_type, v.poster_path, v.thumbnail_path, v.created_at,
-               s.title as series_title, se.season_number, v.episode_number
-        FROM videos v
-        LEFT JOIN series s ON v.series_id = s.id
-        LEFT JOIN seasons se ON v.season_id = se.id
-        ORDER BY v.created_at DESC LIMIT 12
-      `),
-      pool.query(`
-        SELECT v.id, v.title, v.video_type, v.poster_path, v.thumbnail_path, wp.progress_seconds, wp.last_watched_at,
-               s.title as series_title, se.season_number, v.episode_number
-        FROM watch_progress wp
-        JOIN videos v ON wp.video_id = v.id
-        LEFT JOIN series s ON v.series_id = s.id
-        LEFT JOIN seasons se ON v.season_id = se.id
-        WHERE wp.user_id = $1 AND wp.completed = false AND wp.progress_seconds > 0
-        ORDER BY wp.last_watched_at DESC LIMIT 12
-      `, [req.user.id]),
-    ]);
-
-    res.json({
-      stats: {
-        movies: parseInt(movies.rows[0].count),
-        episodes: parseInt(episodes.rows[0].count),
-        series: parseInt(series.rows[0].count),
-        libraries: parseInt(libraries.rows[0].count),
-      },
-      recentlyAdded: recentlyAdded.rows,
-      continueWatching: continueWatching.rows,
-    });
-  } catch (err) {
-    console.error('Dashboard error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-});
-
-// Error handling middleware
+// ─── Error handling ──────────────────────────────────────────────────────
+// Anything a route passes to next(err) — including rejected promises via
+// asyncHandler — lands here.
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  console.error(`Unhandled error on ${req.method} ${req.originalUrl}:`, err && err.stack ? err.stack : err);
+  // The response may already be streaming (video, images); nothing to do but
+  // let it end, or Express will throw ERR_HTTP_HEADERS_SENT.
+  if (res.headersSent) return next(err);
   res.status(500).json({ error: 'Error interno del servidor' });
 });
 
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🎬 ubeFlix API running on port ${PORT}`);
-  console.log(`   Health: http://localhost:${PORT}/api/health`);
-  console.log(`   Videos path: ${process.env.VIDEOS_PATH || './videos'}\n`);
-
-  // Start subtitle download cron job
-  if (process.env.OPENSUBTITLES_API_KEY) {
-    startSubtitleCron();
-  } else {
-    console.log('⚠️  OPENSUBTITLES_API_KEY not set — subtitle cron disabled');
+// ─── Startup ─────────────────────────────────────────────────────────────
+// Migrations run before the first request so routes can assume the schema
+// exists, instead of each one running DDL on every call.
+async function start() {
+  try {
+    await runMigrations();
+  } catch (err) {
+    // Keep serving: /api/health stays up and the logs say what went wrong,
+    // which beats a container in a crash loop.
+    console.error('❌ No se pudieron aplicar las migraciones:', err.message);
   }
-});
+
+  await bootstrapAdmin();
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n🎬 ubeFlix API running on port ${PORT}`);
+    console.log(`   Health: http://localhost:${PORT}/api/health`);
+    console.log(`   Videos path: ${process.env.VIDEOS_PATH || './videos'}\n`);
+
+    // Reset any tracks stuck in 'downloading' from previous runs
+    initSpotdlConfig();
+    resetStuckDownloads();
+    // Resume any unfinished torrent downloads and start the stats poller
+    resumeTorrents();
+    // Start subtitle download cron job
+    if (process.env.OPENSUBTITLES_API_KEY) {
+      startSubtitleCron();
+    } else {
+      console.log('⚠️  OPENSUBTITLES_API_KEY not set — subtitle cron disabled');
+    }
+  });
+}
+
+start();
